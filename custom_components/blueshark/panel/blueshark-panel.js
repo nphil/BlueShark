@@ -12,6 +12,20 @@ import './steps/identify.js';
 import './steps/learn.js';
 import './steps/finish.js';
 
+/** Inline SVG so the panel needs none of HA's internal icon elements. */
+function svgIcon(path) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('focusable', 'false');
+  svg.setAttribute('aria-hidden', 'true');
+  const d = document.createElementNS(ns, 'path');
+  d.setAttribute('d', path);
+  d.setAttribute('fill', 'currentColor');
+  svg.append(d);
+  return svg;
+}
+
 const STEP_LABELS = { find: 'Find', identify: 'Identify', learn: 'Learn', finish: 'Finish' };
 const STEP_TAGS = { find: 'bs-step-find', identify: 'bs-step-identify', learn: 'bs-step-learn', finish: 'bs-step-finish' };
 
@@ -36,12 +50,41 @@ class BlueSharkPanel extends HTMLElement {
     });
 
     this._stepHost = h('div', { class: 'bs-content' });
-    const header = h('header', { style: { padding: '16px 16px 0' } }, [
-      h('h1', { style: { margin: '0', fontSize: '1.4em' } }, 'BlueShark'),
-      h('p', { class: 'bs-empty', style: { margin: '4px 0 0' } }, 'Add any BLE device through a guided, evidence-first wizard.'),
+    // Home Assistant renders a custom panel full-bleed: the panel itself owns the top bar, and on
+    // a narrow viewport it is the ONLY thing that can reopen the sidebar (the companion apps hide
+    // it, and there is no browser chrome to escape through). The documented mechanism is the
+    // window-level `hass-toggle-menu` event that `ha-menu-button` fires, so the button below is a
+    // real sidebar toggle rather than a decorative icon - and it is hidden when HA is already
+    // showing a persistent sidebar, where a second control would be meaningless.
+    this._menuButton = h(
+      'button',
+      {
+        class: 'bs-menu-button',
+        type: 'button',
+        title: 'Open the Home Assistant sidebar',
+        'aria-label': 'Open the Home Assistant sidebar',
+        onclick: () => this._toggleSidebar(),
+      },
+      // mdi:menu, inlined: a panel must not depend on HA's internal icon components.
+      [svgIcon('M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z')],
+    );
+    const header = h('header', { class: 'bs-appbar' }, [
+      this._menuButton,
+      h('div', { class: 'bs-appbar-titles' }, [
+        h('h1', {}, 'BlueShark'),
+        h('p', {}, 'Add any BLE device through a guided, evidence-first wizard.'),
+      ]),
     ]);
     const shell = h('div', { class: 'bs-shell' }, [this._stepper, this._stepHost]);
     this.shadowRoot.append(header, shell);
+  }
+
+  /**
+   * Asks Home Assistant to open its sidebar. `hass-toggle-menu` is the event the frontend listens
+   * for on the window; it must bubble out of the shadow root, hence `composed: true`.
+   */
+  _toggleSidebar() {
+    this.dispatchEvent(new CustomEvent('hass-toggle-menu', { bubbles: true, composed: true }));
   }
 
   set hass(value) {
@@ -62,6 +105,8 @@ class BlueSharkPanel extends HTMLElement {
     this._narrow = Boolean(value);
     if (this._narrow) this.setAttribute('narrow', '');
     else this.removeAttribute('narrow');
+    // HA sets `narrow` exactly when it has collapsed the sidebar out of view.
+    if (this._menuButton) this._menuButton.hidden = !this._narrow;
   }
 
   get narrow() {

@@ -289,3 +289,20 @@ test('RESTART clears persisted state and returns a brand-new wizard', () => {
   assert.equal(wizard.getState().find.selectedAddress, null);
   assert.equal(storage.raw.has('blueshark-wizard-state-v1'), false);
 });
+
+// --- panel chrome: the sidebar toggle is the only way back on a narrow screen -----------------
+import { test as chromeTest } from 'node:test';
+import chromeAssert from 'node:assert/strict';
+
+chromeTest('the panel source wires the menu button to HA\'s own sidebar event', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const src = await readFile(
+    new URL('../../custom_components/blueshark/panel/blueshark-panel.js', import.meta.url),
+    'utf8',
+  );
+  // HA listens for `hass-toggle-menu` on the window; it must escape the shadow root to get there.
+  chromeAssert.match(src, /hass-toggle-menu/);
+  chromeAssert.match(src, /composed:\s*true/);
+  // A decorative icon would be worse than none: the button only exists while HA hides its sidebar.
+  chromeAssert.match(src, /_menuButton\.hidden = !this\._narrow/);
+});

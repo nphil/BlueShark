@@ -32,6 +32,43 @@ export const PANEL_CSS = `
 a { color: var(--bs-primary); }
 :focus-visible { outline: 2px solid var(--bs-primary); outline-offset: 2px; }
 
+.bs-appbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  min-height: var(--header-height, 56px);
+  box-sizing: border-box;
+  background: var(--app-header-background-color, var(--primary-color));
+  color: var(--app-header-text-color, var(--text-primary-color, #fff));
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.bs-appbar-titles h1 { margin: 0; font-size: 1.15em; font-weight: 500; line-height: 1.2; }
+.bs-appbar-titles p { margin: 0; font-size: 0.8em; opacity: 0.85; }
+
+.bs-menu-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.bs-menu-button[hidden] { display: none; }
+.bs-menu-button:hover { background: rgba(255, 255, 255, 0.12); }
+.bs-menu-button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.bs-menu-button svg { width: 24px; height: 24px; }
+
 .bs-shell {
   display: flex;
   flex-direction: row;
