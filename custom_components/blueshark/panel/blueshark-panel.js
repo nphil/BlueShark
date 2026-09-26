@@ -6,25 +6,11 @@
 import { adoptSharedStyles } from './styles.js';
 import { createWizard, STEP_ORDER, reachableSteps } from './wizard.js';
 import { BlueSharkApi } from './api.js';
-import { h, clear, switchField } from './components.js';
+import { h, clear, switchField, svgIcon } from './components.js';
 import './steps/find.js';
 import './steps/identify.js';
 import './steps/learn.js';
 import './steps/finish.js';
-
-/** Inline SVG so the panel needs none of HA's internal icon elements. */
-function svgIcon(path) {
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('focusable', 'false');
-  svg.setAttribute('aria-hidden', 'true');
-  const d = document.createElementNS(ns, 'path');
-  d.setAttribute('d', path);
-  d.setAttribute('fill', 'currentColor');
-  svg.append(d);
-  return svg;
-}
 
 const STEP_LABELS = { find: 'Find', identify: 'Identify', learn: 'Learn', finish: 'Finish' };
 const STEP_TAGS = { find: 'bs-step-find', identify: 'bs-step-identify', learn: 'bs-step-learn', finish: 'bs-step-finish' };

@@ -233,8 +233,9 @@ a { color: var(--lu-accent); }
 .bs-card__header:not(:disabled):hover { background: var(--lu-tile); }
 .bs-card__heading { font-size: 1.1em; font-weight: 600; margin: 0; color: var(--lu-ink); }
 .bs-card__subheading { color: var(--lu-ink-2); font-size: 0.9em; margin: 2px 0 0; }
-.bs-card__chevron { margin-left: auto; transition: transform var(--lu-motion-focus) var(--lu-ease); color: var(--lu-ink-2); }
+.bs-card__chevron { margin-left: auto; display: inline-flex; width: 24px; height: 24px; transition: transform var(--lu-motion-focus) var(--lu-ease); color: var(--lu-ink-2); }
 .bs-card[open] .bs-card__chevron { transform: rotate(180deg); }
+.bs-card__chevron svg { width: 24px; height: 24px; }
 .bs-card__body { padding: 0 16px 16px; display: flex; flex-direction: column; gap: 14px; }
 .bs-card__body[hidden] { display: none; }
 

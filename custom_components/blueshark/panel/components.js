@@ -62,6 +62,20 @@ function appendChildren(el, children) {
 
 /** Minimal hyperscript: h('div', {class:'x', onClick:fn}, ['text', childNode]). Skips
  * null/undefined/false props and children at any nesting depth so ternaries read naturally. */
+/** Inline SVG so the panel needs none of HA's internal icon elements. */
+export function svgIcon(path) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('focusable', 'false');
+  svg.setAttribute('aria-hidden', 'true');
+  const d = document.createElementNS(ns, 'path');
+  d.setAttribute('d', path);
+  d.setAttribute('fill', 'currentColor');
+  svg.append(d);
+  return svg;
+}
+
 export function h(tag, props = {}, children = []) {
   const el = document.createElement(tag);
   applyProps(el, props);
@@ -295,7 +309,7 @@ class BsCard extends HTMLElement {
           h('p', { class: 'bs-card__heading', id: this._headingId }, this._heading),
           this._subheading ? h('p', { class: 'bs-card__subheading' }, this._subheading) : null,
         ]),
-        h('span', { class: 'bs-card__chevron', 'aria-hidden': 'true' }, '\u25BE'),
+        h('span', { class: 'bs-card__chevron', 'aria-hidden': 'true' }, [svgIcon('M7.41 8.58L12 13.17l4.59-4.59L18 10l-6 6-6-6 1.41-1.42z')]),
       ],
     );
     const body = h('div', { class: 'bs-card__body', hidden: !this._open, role: 'region', 'aria-labelledby': this._headingId }, [
