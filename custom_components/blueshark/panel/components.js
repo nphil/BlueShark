@@ -1,8 +1,9 @@
 // Small vanilla custom-element toolkit for the BlueShark wizard: a hyperscript-ish DOM builder,
-// a handful of plain-input field factories, and the six reusable components the steps are built
-// from (card, stepper, chip, table, hex field, confirm dialog). Every element styles itself only
-// from the shared, theme-variable-only stylesheet in styles.js. Requires a DOM; never imported by
-// the Node test suite (format.js/wizard.js/api.js are the pure, tested layer).
+// a handful of plain-input field factories (including a Lucent-styled switch), and the six
+// reusable components the steps are built from (card, stepper, chip, table, hex field,
+// hold-to-confirm button). Every element styles itself only from the shared Lucent/HA token
+// stylesheet in styles.js. Requires a DOM; never imported by the Node test suite
+// (format.js/wizard.js/api.js are the pure, tested layer).
 
 import { adoptSharedStyles } from './styles.js';
 import { parseHex } from './format.js';
@@ -149,6 +150,73 @@ export function checkboxField({ label, checked = false, onChange, id, disabled =
   });
   const element = h('div', { class: 'bs-checkbox-row' }, [input, h('label', { htmlFor: checkboxId }, label)]);
   return { element, input };
+}
+
+export function textareaField({ label, value = '', onInput, onChange, id, placeholder, mono = false, rows = 10, disabled = false } = {}) {
+  const areaId = id || uid('txa');
+  const textarea = h('textarea', {
+    id: areaId,
+    value,
+    placeholder,
+    disabled,
+    rows,
+    class: mono ? 'bs-mono' : null,
+    onInput: onInput ? (event) => onInput(event.target.value) : null,
+    onChange: onChange ? (event) => onChange(event.target.value) : null,
+  });
+  const element = h('div', { class: 'bs-field' }, [label ? h('label', { htmlFor: areaId }, label) : null, textarea]);
+  return { element, textarea };
+}
+
+/** A labeled on/off switch (Lucent section 8): a native checkbox under a CSS-drawn track/thumb,
+ * so it stays keyboard- and screen-reader-operable while looking like a real toggle rather than a
+ * checkbox. Used for the single Advanced-mode control in the app bar. */
+export function switchField({ label, checked = false, onChange, id, disabled = false } = {}) {
+  const switchId = id || uid('sw');
+  const input = h('input', {
+    type: 'checkbox',
+    role: 'switch',
+    id: switchId,
+    checked,
+    disabled,
+    class: 'bs-switch__input',
+    onChange: onChange ? (event) => onChange(event.target.checked) : null,
+  });
+  const element = h('div', { class: 'bs-switch-row' }, [
+    h('span', { class: 'bs-switch' }, [input, h('span', { class: 'bs-switch__track', 'aria-hidden': 'true' })]),
+    label ? h('label', { htmlFor: switchId }, label) : null,
+  ]);
+  return { element, input };
+}
+
+/** A row of large pills for a small (2-4 option) mutually exclusive choice (Lucent section 8's
+ * "Segmented control"): the selected pill gets accent fill + accentInk, others stay glass. The
+ * wrapper is a CSS containment context (see .bs-segmented-wrap in styles.js) so the row collapses
+ * to a stacked list -- the "stepper" register the design language allows at narrow widths --
+ * purely by its own available width, not the viewport. For an open-ended or long option list, use
+ * selectField instead: a native <select> already is that narrow-width register. */
+export function segmentedField({ label, options, value, onChange, id, disabled = false } = {}) {
+  const groupId = id || uid('seg');
+  const labelId = label ? `${groupId}-label` : null;
+  const buttons = (options ?? []).map((opt) =>
+    h(
+      'button',
+      {
+        type: 'button',
+        role: 'radio',
+        'aria-checked': String(opt.value === value),
+        class: opt.value === value ? 'bs-segment bs-segment--selected' : 'bs-segment',
+        disabled,
+        onClick: onChange ? () => onChange(opt.value) : null,
+      },
+      opt.label,
+    ),
+  );
+  const element = h('div', { class: 'bs-field' }, [
+    label ? h('span', { id: labelId }, label) : null,
+    h('div', { class: 'bs-segmented-wrap' }, [h('div', { class: 'bs-segmented', role: 'radiogroup', 'aria-labelledby': labelId }, buttons)]),
+  ]);
+  return { element };
 }
 
 function define(name, ctor) {
@@ -524,57 +592,92 @@ class BsTable extends HTMLElement {
   }
 }
 
-// --- <bs-confirm-dialog> -----------------------------------------------------------
-// A native <dialog>-backed confirm. `.open({title, message, confirmLabel, cancelLabel, danger})`
-// returns a Promise<boolean>: true only when the operator clicks the confirm button.
+// --- <bs-hold-button> ----------------------------------------------------------------
+// A press-and-hold confirm for destructive/overwrite actions (Lucent sections 8 and 10): the
+// fill sweeps across the pill over --lu-hold (1500ms) while held; releasing early snaps the fill
+// back over a fast 150ms transition instead of firing "confirm". A plain click never confirms
+// anything, and there is no keyboard shortcut that skips the hold. Fires "confirm" (bubbles,
+// composed) only once the sweep completes uninterrupted.
 
-class BsConfirmDialog extends HTMLElement {
+class BsHoldButton extends HTMLElement {
   constructor() {
     super();
-    this._resolve = null;
+    this._label = 'Hold to confirm';
+    this._disabled = false;
+    this._holding = false;
     this.attachShadow({ mode: 'open' });
     adoptSharedStyles(this.shadowRoot);
     this._render();
   }
 
+  set label(value) {
+    this._label = String(value ?? '');
+    if (this._labelEl) this._labelEl.textContent = this._label;
+  }
+
+  get label() {
+    return this._label;
+  }
+
+  set disabled(value) {
+    this._disabled = Boolean(value);
+    if (this._button) this._button.disabled = this._disabled;
+    if (this._disabled) this._cancel();
+  }
+
+  get disabled() {
+    return this._disabled;
+  }
+
+  _start() {
+    if (this._disabled || this._holding) return;
+    this._holding = true;
+    this._button.dataset.holding = 'true';
+  }
+
+  _cancel() {
+    if (!this._holding) return;
+    this._holding = false;
+    delete this._button.dataset.holding;
+  }
+
+  // The fill's transform transition ends both when a full 1500ms hold completes (still
+  // `_holding`, since nothing has cancelled it) and when a cancelled hold snaps back to 0 over
+  // its own fast 150ms transition (already not `_holding` by the time this fires) -- only the
+  // former should ever confirm.
+  _onFillTransitionEnd(event) {
+    if (event.propertyName !== 'transform' || !this._holding) return;
+    this._holding = false;
+    delete this._button.dataset.holding;
+    this.dispatchEvent(new CustomEvent('confirm', { bubbles: true, composed: true }));
+  }
+
   _render() {
     clear(this.shadowRoot);
-    this._titleEl = h('h2', { class: 'bs-dialog__title' }, '');
-    this._messageEl = h('p', { class: 'bs-dialog__message' }, '');
-    this._cancelBtn = h('button', { type: 'button', class: 'bs-btn', onClick: () => this._close(false) }, 'Cancel');
-    this._confirmBtn = h('button', { type: 'button', class: 'bs-btn bs-btn--danger', onClick: () => this._close(true) }, 'Confirm');
-    this._dialog = h(
-      'dialog',
-      { class: 'bs-dialog', 'aria-labelledby': 'bs-dialog-title', 'aria-describedby': 'bs-dialog-message' },
-      [this._titleEl, this._messageEl, h('div', { class: 'bs-dialog__actions' }, [this._cancelBtn, this._confirmBtn])],
+    this._fill = h('span', { class: 'bs-hold__fill', 'aria-hidden': 'true' });
+    this._labelEl = h('span', { class: 'bs-hold__label' }, this._label);
+    this._button = h(
+      'button',
+      {
+        type: 'button',
+        class: 'bs-btn bs-btn--danger bs-hold',
+        disabled: this._disabled,
+        onPointerdown: (event) => { event.preventDefault(); this._start(); },
+        onPointerup: () => this._cancel(),
+        onPointerleave: () => this._cancel(),
+        onPointercancel: () => this._cancel(),
+        onKeydown: (event) => {
+          if (event.key === ' ' || event.key === 'Enter') { event.preventDefault(); this._start(); }
+        },
+        onKeyup: (event) => {
+          if (event.key === ' ' || event.key === 'Enter') this._cancel();
+        },
+        onBlur: () => this._cancel(),
+      },
+      [this._fill, this._labelEl],
     );
-    this._titleEl.id = 'bs-dialog-title';
-    this._messageEl.id = 'bs-dialog-message';
-    this._dialog.addEventListener('cancel', (event) => {
-      event.preventDefault();
-      this._close(false);
-    });
-    this.shadowRoot.append(this._dialog);
-  }
-
-  _close(result) {
-    if (this._dialog.open) this._dialog.close();
-    const resolve = this._resolve;
-    this._resolve = null;
-    if (resolve) resolve(result);
-  }
-
-  open({ title = 'Are you sure?', message = '', confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = true } = {}) {
-    this._titleEl.textContent = title;
-    this._messageEl.textContent = message;
-    this._confirmBtn.textContent = confirmLabel;
-    this._cancelBtn.textContent = cancelLabel;
-    this._confirmBtn.className = danger ? 'bs-btn bs-btn--danger' : 'bs-btn bs-btn--primary';
-    this._dialog.showModal();
-    this._confirmBtn.focus();
-    return new Promise((resolve) => {
-      this._resolve = resolve;
-    });
+    this._fill.addEventListener('transitionend', (event) => this._onFillTransitionEnd(event));
+    this.shadowRoot.append(this._button);
   }
 }
 
@@ -583,4 +686,4 @@ define('bs-chip', BsChip);
 define('bs-stepper', BsStepper);
 define('bs-hex-field', BsHexField);
 define('bs-table', BsTable);
-define('bs-confirm-dialog', BsConfirmDialog);
+define('bs-hold-button', BsHoldButton);

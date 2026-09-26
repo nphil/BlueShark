@@ -18,6 +18,7 @@ export const DEFAULT_LISTEN_SECONDS = 10;
 
 export const SCHEMA_VERSION = 1;
 export const STORAGE_KEY = 'blueshark-wizard-state-v1';
+export const ADVANCED_STORAGE_KEY = 'blueshark-wizard-advanced-v1';
 
 // --- Initial state -----------------------------------------------------------
 
@@ -79,7 +80,7 @@ function initialLearn() {
 }
 
 function initialFinish() {
-  return { name: '', creating: false, createError: null, entryId: null, created: false };
+  return { name: '', creating: false, createError: null, entryId: null, created: false, starterSeeded: false };
 }
 
 /** A brand-new wizard, as if the panel had just been opened for the first time. */
@@ -87,6 +88,7 @@ export function initialState() {
   return {
     version: SCHEMA_VERSION,
     step: STEP_ORDER[0],
+    advanced: false,
     find: initialFind(),
     devices: {},
     identify: initialIdentify(),
@@ -226,6 +228,130 @@ export function uniqueCommandKey(name, existingKeys) {
   let n = 2;
   while (taken.has(`${base}-${n}`)) n += 1;
   return `${base}-${n}`;
+}
+
+// --- Beginner-path helpers: starter commands and destructive-opcode safety --------
+//
+// `matches` is state.identify.matches (the raw FamilyMatch objects from blueshark/identify,
+// stored verbatim by the IDENTIFY_SUCCESS reducer case below); `codecId` is state.identify.codecId
+// (the codec actually in use, which may differ from every match's own codec_id once the operator
+// overrides it in Learn -- these look up whichever match, if any, still agrees with it). Every
+// engine field consumed here (`starter_command_map`, `safety`) is optional: an engine that does
+// not send it yet degrades to "nothing to offer", never an error.
+
+/** The starter_command_map belonging to whichever identify match uses `codecId`, or null when
+ * none correlates or it is empty (unknown/overridden codec, an engine that does not send the
+ * field yet, or a family with nothing beginner-safe to offer this device). */
+export function starterCommandMapForCodec(matches, codecId) {
+  if (!Array.isArray(matches) || !codecId) return null;
+  const match = matches.find((m) => m && m.codec_id === codecId);
+  const starter = match?.starter_command_map;
+  return starter && typeof starter === 'object' && Object.keys(starter).length > 0 ? starter : null;
+}
+
+/** The `safety` list ({opcode, reason}) belonging to whichever identify match uses `codecId`, or
+ * [] when none correlates (unknown/overridden codec, or an engine that does not send `safety`
+ * yet). */
+export function safetyForCodec(matches, codecId) {
+  if (!Array.isArray(matches) || !codecId) return [];
+  const match = matches.find((m) => m && m.codec_id === codecId);
+  return Array.isArray(match?.safety) ? match.safety : [];
+}
+
+/** Opcodes within [start, end] that `safety` marks destructive while a sweep is configured to
+ * skip destructive opcodes -- i.e. exactly the opcodes the sweep silently steps over today.
+ * Returns [] once includeDestructive is true (nothing is being held back). */
+export function blockedSweepOpcodes(safety, { start, end, includeDestructive }) {
+  if (includeDestructive || !Array.isArray(safety) || safety.length === 0) return [];
+  const lo = Number(start);
+  const hi = Number(end);
+  return safety.filter((entry) => {
+    const opcode = Number(entry?.opcode);
+    return Number.isInteger(opcode) && opcode >= lo && opcode <= hi;
+  });
+}
+
+// --- Hand-edited command-map JSON (Advanced only) ----------------------------------
+//
+// Mirrors command_map.py's validate_command_map schema exactly (the same rules
+// buildButtonEntry/buildNumberEntry/buildSwitchEntry above enforce for the structured builder
+// form), so a hand-edited map either passes cleanly or fails here with the same kind of specific,
+// actionable message before it ever reaches the wire.
+
+const COMMAND_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const MAX_COMMANDS = 256;
+const MAX_NAME_CHARS = 128;
+const MAX_NOTE_CHARS = 512;
+
+function validatePayloadShape(entry, label) {
+  const hasPayload = Object.prototype.hasOwnProperty.call(entry, 'payload_hex');
+  const hasOpcode = 'opcode' in entry || 'argument_hex' in entry;
+  if (hasPayload && hasOpcode) throw new Error(`${label} must use either payload_hex or opcode + argument_hex, not both.`);
+  if (hasPayload) {
+    parseHex(entry.payload_hex, { allowEmpty: false });
+    return;
+  }
+  if (!('opcode' in entry) || !('argument_hex' in entry)) {
+    throw new Error(`${label} must specify payload_hex, or opcode together with argument_hex.`);
+  }
+  parseOpcode(entry.opcode);
+  parseHex(entry.argument_hex, { allowEmpty: true });
+}
+
+function validateEntryShape(entry, label) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`${label} must be an object.`);
+  if (!['button', 'number', 'switch'].includes(entry.kind)) {
+    throw new Error(`${label}.kind must be "button", "number" or "switch".`);
+  }
+  if (typeof entry.name !== 'string' || !entry.name.trim()) throw new Error(`${label}.name is required.`);
+  if (entry.name.trim().length > MAX_NAME_CHARS) throw new Error(`${label}.name must be at most ${MAX_NAME_CHARS} characters.`);
+  if ('characteristic' in entry && !UUID_RE.test(String(entry.characteristic))) {
+    throw new Error(`${label}.characteristic must be a valid UUID.`);
+  }
+  if ('note' in entry && typeof entry.note !== 'string') throw new Error(`${label}.note must be a string.`);
+  if (typeof entry.note === 'string' && entry.note.length > MAX_NOTE_CHARS) {
+    throw new Error(`${label}.note must be at most ${MAX_NOTE_CHARS} characters.`);
+  }
+  if (entry.kind === 'button') {
+    validatePayloadShape(entry, label);
+    return;
+  }
+  if (entry.kind === 'number') {
+    if (!('opcode' in entry)) throw new Error(`${label}.opcode is required for kind number.`);
+    parseOpcode(entry.opcode);
+    const min = entry.min ?? 0;
+    const max = entry.max ?? 255;
+    parseOpcode(min);
+    parseOpcode(max);
+    if (min >= max) throw new Error(`${label}.min must be less than max.`);
+    return;
+  }
+  for (const side of ['on', 'off']) {
+    if (!entry[side] || typeof entry[side] !== 'object') throw new Error(`${label}.${side} is required for kind switch.`);
+    validatePayloadShape(entry[side], `${label}.${side}`);
+    if ('characteristic' in entry[side] && !UUID_RE.test(String(entry[side].characteristic))) {
+      throw new Error(`${label}.${side}.characteristic must be a valid UUID.`);
+    }
+  }
+}
+
+/** Validate hand-edited command-map JSON against the same shape command_map.py's
+ * validate_command_map enforces, so a save either passes cleanly or fails with a specific,
+ * actionable message before it ever reaches the wire. Returns `parsed` unchanged on success. */
+export function validateCommandMapJson(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('The command map must be a JSON object of { commandId: entry }.');
+  }
+  const keys = Object.keys(parsed);
+  if (keys.length > MAX_COMMANDS) throw new Error(`A command map holds at most ${MAX_COMMANDS} commands.`);
+  for (const key of keys) {
+    if (!COMMAND_ID_RE.test(key)) {
+      throw new Error(`"${key}" must be 1-64 characters of letters, digits, "_", "." or "-", starting with a letter or digit.`);
+    }
+    validateEntryShape(parsed[key], `"${key}"`);
+  }
+  return parsed;
 }
 
 // --- Device list merging ---------------------------------------------------------
@@ -387,6 +513,27 @@ export function reduce(state, action) {
         },
       };
 
+    case 'RENAME_COMMAND': {
+      const key = action.key;
+      const name = String(action.name ?? '').trim();
+      if (!key || !state.learn.commandMap[key] || !name) return state;
+      return {
+        ...state,
+        learn: {
+          ...state.learn,
+          commandMap: { ...state.learn.commandMap, [key]: { ...state.learn.commandMap[key], name } },
+        },
+      };
+    }
+
+    case 'SET_COMMAND_MAP': {
+      const commandMap = action.commandMap && typeof action.commandMap === 'object' ? action.commandMap : {};
+      return {
+        ...state,
+        learn: { ...state.learn, commandMap, commandOrder: Object.keys(commandMap) },
+      };
+    }
+
     case 'SWEEP_CONFIGURE':
       return { ...state, learn: { ...state.learn, sweep: { ...state.learn.sweep, config: { ...state.learn.sweep.config, ...action.config } } } };
 
@@ -447,6 +594,32 @@ export function reduce(state, action) {
     case 'SET_DEVICE_NAME':
       return { ...state, finish: { ...state.finish, name: action.name ?? '' } };
 
+    // Beginner path: Finish seeds the draft command map from the identify match's
+    // starter_command_map exactly once per device (guarded by finish.starterSeeded, not by
+    // commandMap being empty), so an operator who also probed a little in Learn still gets the
+    // beginner-safe defaults merged in rather than choosing between the two. A starter key that
+    // collides with something already in the map (e.g. the operator's own Learn work) is
+    // disambiguated rather than overwritten.
+    case 'SEED_STARTER_COMMANDS': {
+      if (state.finish.starterSeeded) return state;
+      const starter = action.starterCommandMap;
+      if (!starter || typeof starter !== 'object' || Object.keys(starter).length === 0) {
+        return { ...state, finish: { ...state.finish, starterSeeded: true } };
+      }
+      const nextMap = { ...state.learn.commandMap };
+      const nextOrder = [...state.learn.commandOrder];
+      for (const [key, entry] of Object.entries(starter)) {
+        const finalKey = nextOrder.includes(key) ? uniqueCommandKey(entry?.name ?? key, nextOrder) : key;
+        nextMap[finalKey] = entry;
+        nextOrder.push(finalKey);
+      }
+      return {
+        ...state,
+        learn: { ...state.learn, commandMap: nextMap, commandOrder: nextOrder },
+        finish: { ...state.finish, starterSeeded: true },
+      };
+    }
+
     case 'CREATE_ENTRY_START':
       return { ...state, finish: { ...state.finish, creating: true, createError: null } };
 
@@ -456,8 +629,14 @@ export function reduce(state, action) {
     case 'CREATE_ENTRY_ERROR':
       return { ...state, finish: { ...state.finish, creating: false, createError: action.error ?? null } };
 
+    case 'SET_ADVANCED': {
+      const advanced = Boolean(action.advanced);
+      if (advanced === state.advanced) return state;
+      return { ...state, advanced };
+    }
+
     case 'RESTART':
-      return initialState();
+      return { ...initialState(), advanced: state.advanced };
 
     default:
       return state;
@@ -574,14 +753,37 @@ export function clearPersistedState(storage, key = STORAGE_KEY) {
   }
 }
 
+/** Whether the operator has switched on Advanced mode: a durable UI preference (like a dark-mode
+ * toggle), remembered independently of wizard progress in its own storage key so RESTART (which
+ * deliberately clears the wizard-progress key for a fresh device) and picking a new device never
+ * reset it. */
+export function restoreAdvanced(storage, key = ADVANCED_STORAGE_KEY) {
+  const store = resolveStorage(storage);
+  try {
+    return store.getItem(key) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/** Best-effort persistence, same failure handling as persistState. */
+export function persistAdvanced(storage, advanced, key = ADVANCED_STORAGE_KEY) {
+  const store = resolveStorage(storage);
+  try {
+    store.setItem(key, advanced ? 'true' : 'false');
+  } catch {
+    // Private browsing or a full quota: persistence is a nicety, not a requirement.
+  }
+}
+
 // --- Store -----------------------------------------------------------------
 
 /** A tiny observable store around `reduce`, restoring from `storage` (default: localStorage,
  * falling back to an in-memory stub where localStorage does not exist) and persisting every
  * dispatch that actually changes state. */
-export function createWizard({ storage, storageKey = STORAGE_KEY } = {}) {
+export function createWizard({ storage, storageKey = STORAGE_KEY, advancedStorageKey = ADVANCED_STORAGE_KEY } = {}) {
   const store = resolveStorage(storage);
-  let state = restoreState(store, storageKey);
+  let state = { ...restoreState(store, storageKey), advanced: restoreAdvanced(store, advancedStorageKey) };
   const listeners = new Set();
 
   function dispatch(action) {
@@ -592,6 +794,9 @@ export function createWizard({ storage, storageKey = STORAGE_KEY } = {}) {
       clearPersistedState(store, storageKey);
     } else {
       persistState(store, state, storageKey);
+    }
+    if (action.type === 'SET_ADVANCED') {
+      persistAdvanced(store, state.advanced, advancedStorageKey);
     }
     for (const listener of listeners) listener(state, action);
     return state;

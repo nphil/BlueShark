@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .codecs import Codec
+from .codecs import Codec, get_codec
 from .const import (
     WS_ERROR_BUSY,
     WS_ERROR_NO_ROUTE,
@@ -33,6 +33,7 @@ from .const import (
 )
 from .families import (
     COOLLED_MANUFACTURER,
+    DedicatedIntegration,
     FamilyConfidence,
     FamilyMatch,
     FingerprintInput,
@@ -69,6 +70,36 @@ def confidence_score(confidence: FamilyConfidence) -> float:
     return _CONFIDENCE_SCORE[confidence]
 
 
+_UNKNOWN_DESTRUCTIVE_REASON = "Unknown effect; blocked to be safe"
+
+
+def safety_notes(codec: Codec | None) -> list[dict[str, Any]]:
+    """`{opcode, reason}` for every opcode `codec` marks destructive, sorted by opcode.
+
+    A destructive opcode missing from `codec.destructive_reasons` still gets a row here -
+    "no reason recorded" must never read as "safe to send" - with a generic fallback reason.
+    `codec` is `None` for a family-less command-channel match, which yields `[]`.
+    """
+
+    if codec is None:
+        return []
+    return [
+        {"opcode": opcode, "reason": codec.destructive_reasons.get(opcode, _UNKNOWN_DESTRUCTIVE_REASON)}
+        for opcode in sorted(codec.destructive_opcodes)
+    ]
+
+
+def _shape_dedicated_integration(integration: DedicatedIntegration | None) -> dict[str, str] | None:
+    if integration is None:
+        return None
+    return {
+        "domain": integration.domain,
+        "name": integration.name,
+        "url": integration.url,
+        "summary": integration.summary,
+    }
+
+
 def shape_family_match(match: FamilyMatch) -> dict[str, Any]:
     """One `FamilyMatch` -> the wire shape shared by scan/identify/enumerate hints.
 
@@ -77,6 +108,7 @@ def shape_family_match(match: FamilyMatch) -> dict[str, Any]:
     so nothing about the family table's own evidence grading is lost.
     """
 
+    codec = get_codec(match.codec_id) if match.codec_id else None
     return {
         "id": match.family_id,
         "name": match.name,
@@ -86,6 +118,9 @@ def shape_family_match(match: FamilyMatch) -> dict[str, Any]:
         "codec_id": match.codec_id,
         "characteristic_hints": list(match.command_characteristic_hints),
         "driver_url": match.public_driver_url,
+        "starter_command_map": dict(match.starter_command_map) if match.starter_command_map else None,
+        "dedicated_integration": _shape_dedicated_integration(match.dedicated_integration),
+        "safety": safety_notes(codec),
     }
 
 
@@ -352,6 +387,27 @@ def error_code_for_exception(exc: BaseException) -> str:
         if code is not None:
             return code
     return WS_ERROR_REFUSED
+
+
+def flow_id_to_adopt(address: str, in_progress: list[dict[str, Any]]) -> str | None:
+    """Pick the in-progress config flow (if any) already claiming `address` as its unique id.
+
+    Home Assistant's own bluetooth discovery starts a flow the moment it sees a new device
+    advertise. If the panel's guided wizard then tries to create an entry for that same
+    address, `ConfigFlow.async_set_unique_id` aborts with `already_in_progress` unless that
+    earlier flow is cleared out of the way first. `in_progress` is
+    `hass.config_entries.flow.async_progress_by_handler(DOMAIN)` - a plain list of mappings,
+    so this stays pure and testable without Home Assistant. Returns the `flow_id` to abort via
+    `hass.config_entries.flow.async_abort`, or `None` when nothing is in the way.
+    """
+
+    normalized = address.strip().lower()
+    for flow in in_progress:
+        context = flow.get("context") or {}
+        unique_id = context.get("unique_id")
+        if isinstance(unique_id, str) and unique_id.strip().lower() == normalized:
+            return flow.get("flow_id")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +786,10 @@ def async_register_commands(hass: HomeAssistant) -> None:
         except CommandMapError as err:
             connection.send_error(msg["id"], error_code_for_exception(err), str(err))
             return
+        in_progress = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+        adopted_flow_id = flow_id_to_adopt(msg["address"], in_progress)
+        if adopted_flow_id is not None:
+            hass.config_entries.flow.async_abort(adopted_flow_id)
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
             context={"source": SOURCE_PANEL},
@@ -746,7 +806,10 @@ def async_register_commands(hass: HomeAssistant) -> None:
                 msg["id"], WS_ERROR_REFUSED, result.get("reason") or "could not create the device entry"
             )
             return
-        connection.send_result(msg["id"], {"entry_id": result["result"].entry_id})
+        connection.send_result(
+            msg["id"],
+            {"entry_id": result["result"].entry_id, "adopted_discovery": adopted_flow_id is not None},
+        )
 
     for handler in (
         ws_scan_subscribe,

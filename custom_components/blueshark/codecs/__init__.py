@@ -23,6 +23,11 @@ class Codec(ABC):
     canary: tuple[int, bytes] | None = None
     # Decoded status byte -> human-readable name.
     status_names: dict[int, str] = {}
+    # Destructive opcode -> plain-English reason a sweep must not probe it by default.
+    # A codec with `destructive_opcodes` but no entry here for one of them is missing
+    # documentation, not declaring it safe: callers fall back to a generic
+    # "Unknown effect; blocked to be safe" reason (see `websocket_api.safety_notes`).
+    destructive_reasons: dict[int, str] = {}
 
     @abstractmethod
     def encode(self, payload: bytes) -> bytes:
@@ -51,11 +56,16 @@ class UnknownCodecError(KeyError):
 
 # The submodules subclass Codec, so they can only be imported once it exists.
 from .coolled import CoolLedCodec  # noqa: E402
+from .iledclock import IledClockCodec  # noqa: E402
 from .prefix_suffix import PrefixSuffixCodec  # noqa: E402
 from .raw import RawCodec  # noqa: E402
 
-_CODECS: tuple[type[Codec], ...] = (RawCodec, CoolLedCodec, PrefixSuffixCodec)
-_SHARED: dict[str, Codec] = {RawCodec.id: RawCodec(), CoolLedCodec.id: CoolLedCodec()}
+_CODECS: tuple[type[Codec], ...] = (RawCodec, CoolLedCodec, IledClockCodec, PrefixSuffixCodec)
+_SHARED: dict[str, Codec] = {
+    RawCodec.id: RawCodec(),
+    CoolLedCodec.id: CoolLedCodec(),
+    IledClockCodec.id: IledClockCodec(),
+}
 
 
 def get_codec(codec_id: str, params: dict[str, str] | None = None) -> Codec:

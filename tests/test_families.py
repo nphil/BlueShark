@@ -2,6 +2,8 @@
 
 import unittest
 
+from custom_components.blueshark.codecs import get_codec
+from custom_components.blueshark.command_map import validate_command_map
 from custom_components.blueshark.families import (
     FamilyConfidence,
     FingerprintInput,
@@ -28,11 +30,17 @@ OTHER_WRITE = "12345678-0000-1000-8000-000000000002"
 OTHER_NOTIFY = "12345678-0000-1000-8000-000000000003"
 
 # A real, verified panel: 6-byte id bcdc07000001, 32x16 px, colour mode 4, firmware 0x21.
-ILEDCLOCK = FingerprintInput(
-    name="iLedClock",
+# Named for a generic, unidentified CoolLED variant: starts with "iled" (CoolLED naming) but
+# is not the exact name "iLedClock", which has its own, more specific family below - see
+# ILEDCLOCK_EXACT.
+COOLLED_UNIDENTIFIED = FingerprintInput(
+    name="iLedSign",
     service_uuids=[FFF0],
     manufacturer_data={12692: bytes.fromhex("bcdc070000011000200421")},
 )
+# The exact advertised name the vendor app keys its iLedClock-specific protocol off of
+# (DeviceManager.java ~line 1366-1375: equalsIgnoreCase(ILED_CLOCK)).
+ILEDCLOCK_EXACT = FingerprintInput(name="iLedClock")
 COOLLED_GATT = GattDatabase(
     [GattService(FFF0, [GattCharacteristic(FFF1, ["WRITE", "WRITE_NO_RESPONSE", "NOTIFY"])])]
 )
@@ -42,16 +50,16 @@ MIBEACON = bytes([0x30, 0x58, 0x5B, 0x05, 0x0A, 0x11, 0x22, 0x33, 0x44, 0x55, 0x
 
 def _coolled_with(gatt):
     return FingerprintInput(
-        name=ILEDCLOCK.name,
-        service_uuids=ILEDCLOCK.service_uuids,
-        manufacturer_data=ILEDCLOCK.manufacturer_data,
+        name=COOLLED_UNIDENTIFIED.name,
+        service_uuids=COOLLED_UNIDENTIFIED.service_uuids,
+        manufacturer_data=COOLLED_UNIDENTIFIED.manufacturer_data,
         gatt=gatt,
     )
 
 
 class FamilyIdentificationTests(unittest.TestCase):
-    def test_iledclock_advert_alone_is_a_likely_coolled_panel(self):
-        top = identify(ILEDCLOCK)[0]
+    def test_unidentified_coolled_advert_alone_is_a_likely_coolled_panel(self):
+        top = identify(COOLLED_UNIDENTIFIED)[0]
         self.assertEqual(top.family_id, "coolled")
         self.assertEqual(top.confidence, FamilyConfidence.LIKELY)
         self.assertEqual(top.codec_id, "coolled")
@@ -61,7 +69,7 @@ class FamilyIdentificationTests(unittest.TestCase):
         self.assertIn("firmware 0x21", joined)
 
     def test_matching_gatt_promotes_coolled_to_certain_with_one_more_evidence_line(self):
-        without = identify(ILEDCLOCK)[0]
+        without = identify(COOLLED_UNIDENTIFIED)[0]
         top = identify(_coolled_with(COOLLED_GATT))[0]
         self.assertEqual(top.family_id, "coolled")
         self.assertEqual(top.confidence, FamilyConfidence.CERTAIN)
@@ -109,6 +117,80 @@ class FamilyIdentificationTests(unittest.TestCase):
 
     def test_empty_advert_and_no_gatt_identifies_nothing(self):
         self.assertEqual(identify(FingerprintInput()), [])
+
+
+class IledClockFamilyTests(unittest.TestCase):
+    """The `iledclock` family: exact-name detection, and that it excludes `coolled`."""
+
+    def test_exact_name_is_a_likely_iledclock_match_ranked_above_generic_coolled(self):
+        matches = identify(ILEDCLOCK_EXACT)
+        self.assertEqual(matches[0].family_id, "iledclock")
+        self.assertEqual(matches[0].confidence, FamilyConfidence.LIKELY)
+        self.assertEqual(matches[0].codec_id, "iledclock")
+        self.assertNotIn("coolled", [m.family_id for m in matches])
+
+    def test_near_miss_name_still_falls_back_to_generic_coolled(self):
+        # "iLedHat" starts with "iled" (CoolLED naming) but is not the exact name the vendor
+        # app keys its iLedClock-specific protocol off of.
+        matches = identify(FingerprintInput(name="iLedHat", service_uuids=[FFF0]))
+        self.assertNotIn("iledclock", [m.family_id for m in matches])
+        self.assertEqual(matches[0].family_id, "coolled")
+
+    def test_name_match_is_case_insensitive(self):
+        matches = identify(FingerprintInput(name="ILEDCLOCK"))
+        self.assertEqual(matches[0].family_id, "iledclock")
+
+    def test_gatt_confirm_promotes_to_certain(self):
+        matches = identify(FingerprintInput(name="iLedClock", gatt=COOLLED_GATT))
+        self.assertEqual(matches[0].family_id, "iledclock")
+        self.assertEqual(matches[0].confidence, FamilyConfidence.CERTAIN)
+        self.assertIn("iLedClock command channel confirmed", matches[0].evidence[-1])
+
+    def test_iledclock_never_claimed_from_gatt_alone(self):
+        matches = identify(FingerprintInput(gatt=COOLLED_GATT))
+        self.assertNotIn("iledclock", [m.family_id for m in matches])
+
+    def test_starter_command_map_is_present_only_for_iledclock(self):
+        self.assertIsNotNone(identify(ILEDCLOCK_EXACT)[0].starter_command_map)
+        self.assertIsNone(identify(COOLLED_UNIDENTIFIED)[0].starter_command_map)
+
+    def test_starter_command_map_passes_validation_unchanged_and_has_no_destructive_opcode(self):
+        top = identify(ILEDCLOCK_EXACT)[0]
+        starter = top.starter_command_map
+        self.assertIsNotNone(starter)
+        self.assertEqual(validate_command_map(starter), starter)
+        codec = get_codec(top.codec_id)
+        used_opcodes = set()
+        for entry in starter.values():
+            if entry["kind"] == "switch":
+                used_opcodes.add(entry["on"]["opcode"])
+                used_opcodes.add(entry["off"]["opcode"])
+            else:
+                used_opcodes.add(entry["opcode"])
+        self.assertFalse(used_opcodes & codec.destructive_opcodes)
+
+    def test_starter_command_map_matches_the_sourced_vendor_wire_bytes(self):
+        starter = identify(ILEDCLOCK_EXACT)[0].starter_command_map
+        # ILedClockUtils.java:4749-4754 + ILedClockSettingsFragment.java:115-119,186-188 +
+        # the compiled settings layout's android:max="250" on bright_seek_bar (R.java:8759).
+        self.assertEqual(starter["brightness"]["opcode"], 0x04)
+        self.assertEqual((starter["brightness"]["min"], starter["brightness"]["max"]), (5, 255))
+        # ILedClockUtils.java:5057-5062 + ILedClockRotateActivity.java:42-45.
+        self.assertEqual(starter["rotation"]["opcode"], 0x0C)
+        self.assertEqual((starter["rotation"]["min"], starter["rotation"]["max"]), (0, 3))
+        # ILedClockUtils.java:4738-4747.
+        self.assertEqual(starter["power"]["on"], {"opcode": 5, "argument_hex": "01"})
+        self.assertEqual(starter["power"]["off"], {"opcode": 5, "argument_hex": "00"})
+        # ILedClockUtils.java:4897-4902 getStopwatchReset() - no run byte, unlike start/stop.
+        self.assertEqual(starter["stopwatch_reset"]["argument_hex"], "02")
+        self.assertEqual(starter["stopwatch_start"]["argument_hex"], "0301")
+        self.assertEqual(starter["stopwatch_stop"]["argument_hex"], "0300")
+
+    def test_dedicated_integration_points_at_the_full_ha_integration(self):
+        top = identify(ILEDCLOCK_EXACT)[0]
+        self.assertEqual(top.dedicated_integration.domain, "iledclock")
+        self.assertEqual(top.dedicated_integration.url, "https://github.com/nphil/ha-iledclock")
+        self.assertIsNone(identify(COOLLED_UNIDENTIFIED)[0].dedicated_integration)
 
 
 class VendorLadderTests(unittest.TestCase):

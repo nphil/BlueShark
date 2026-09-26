@@ -5,7 +5,7 @@
 import { h, clear, uid, withPreservedFocus, textField } from '../components.js';
 import { adoptSharedStyles } from '../styles.js';
 import { formatApiErrorMessage, entryDashboardUrl } from '../format.js';
-import { canCreateEntry } from '../wizard.js';
+import { canCreateEntry, starterCommandMapForCodec } from '../wizard.js';
 
 class BsStepFinish extends HTMLElement {
   constructor() {
@@ -74,12 +74,39 @@ class BsStepFinish extends HTMLElement {
     const table = document.createElement('bs-table');
     table.emptyMessage = 'No controls were added \u2014 you can still create the device and add controls later from Learn.';
     table.columns = [
-      { key: 'name', label: 'Name', render: (key) => state.learn.commandMap[key]?.name ?? key },
+      { key: 'name', label: 'Name', render: (key) => this._renderNameField(key, state) },
       { key: 'kind', label: 'Type', render: (key) => state.learn.commandMap[key]?.kind ?? '' },
       { key: 'note', label: 'Note', render: (key) => state.learn.commandMap[key]?.note ?? '' },
+      {
+        key: 'remove',
+        label: '',
+        render: (key) =>
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'bs-btn bs-btn--text',
+              disabled: state.finish.created,
+              onClick: () => this._wizard.dispatch({ type: 'REMOVE_COMMAND', key }),
+            },
+            'Remove',
+          ),
+      },
     ];
     table.rows = state.learn.commandOrder;
     return table;
+  }
+
+  // A beginner arriving with a starter_command_map pre-filled (see SEED_STARTER_COMMANDS in
+  // _doRender) can untick (Remove) or rename any of these, same as anything learned by hand.
+  _renderNameField(key, state) {
+    const { element } = textField({
+      id: `finish-name-${key}`,
+      value: state.learn.commandMap[key]?.name ?? key,
+      disabled: state.finish.created,
+      onChange: (value) => this._wizard.dispatch({ type: 'RENAME_COMMAND', key, name: value }),
+    });
+    return element;
   }
 
   _render() {
@@ -96,8 +123,23 @@ class BsStepFinish extends HTMLElement {
       return;
     }
 
+    // Beginner path: a brand-new device (never an already-configured one -- see the module
+    // comment) gets its draft command map pre-filled from starter_command_map exactly once, as
+    // soon as isExistingDevice resolves to false. Idempotent: SEED_STARTER_COMMANDS itself
+    // no-ops once finish.starterSeeded is set, so a removed starter entry never comes back.
+    if (!state.finish.starterSeeded && state.identify.isExistingDevice === false) {
+      this._wizard.dispatch({
+        type: 'SEED_STARTER_COMMANDS',
+        starterCommandMap: starterCommandMapForCodec(state.identify.matches, state.identify.codecId),
+      });
+    }
+
     const isExisting = state.identify.isExistingDevice;
-    const sections = [h('h3', { style: { margin: '0 0 8px' } }, 'Review'), this._renderReviewTable(state)];
+    const reviewFields = [this._renderReviewTable(state)];
+    if (state.learn.commandOrder.length) {
+      reviewFields.push(h('p', { class: 'bs-empty' }, 'Untick (Remove) or rename any control above before creating the device.'));
+    }
+    const sections = [h('div', { class: 'bs-section' }, [h('h3', {}, 'Review'), ...reviewFields])];
 
     if (isExisting === null) {
       sections.push(h('p', { class: 'bs-empty' }, 'Checking whether this device is already configured\u2026'));

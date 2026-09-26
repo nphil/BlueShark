@@ -6,7 +6,7 @@
 import { adoptSharedStyles } from './styles.js';
 import { createWizard, STEP_ORDER, reachableSteps } from './wizard.js';
 import { BlueSharkApi } from './api.js';
-import { h, clear } from './components.js';
+import { h, clear, switchField } from './components.js';
 import './steps/find.js';
 import './steps/identify.js';
 import './steps/learn.js';
@@ -68,12 +68,18 @@ class BlueSharkPanel extends HTMLElement {
       // mdi:menu, inlined: a panel must not depend on HA's internal icon components.
       [svgIcon('M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z')],
     );
+    this._advancedSwitch = switchField({
+      label: 'Advanced',
+      checked: this._wizard.getState().advanced,
+      onChange: (checked) => this._wizard.dispatch({ type: 'SET_ADVANCED', advanced: checked }),
+    });
     const header = h('header', { class: 'bs-appbar' }, [
       this._menuButton,
       h('div', { class: 'bs-appbar-titles' }, [
         h('h1', {}, 'BlueShark'),
         h('p', {}, 'Add any BLE device through a guided, evidence-first wizard.'),
       ]),
+      this._advancedSwitch.element,
     ]);
     const shell = h('div', { class: 'bs-shell' }, [this._stepper, this._stepHost]);
     this.shadowRoot.append(header, shell);
@@ -143,6 +149,7 @@ class BlueSharkPanel extends HTMLElement {
 
   _renderStepper() {
     const state = this._wizard.getState();
+    this._advancedSwitch.input.checked = state.advanced;
     const reachable = reachableSteps(state);
     const currentIndex = STEP_ORDER.indexOf(state.step);
     this._stepper.steps = STEP_ORDER.map((id, index) => ({

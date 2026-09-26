@@ -67,7 +67,12 @@ export class BlueSharkApi {
   /**
    * blueshark/identify {address} ->
    * {matches: [{id, name, confidence, confidence_label, evidence, codec_id,
-   *   characteristic_hints, driver_url}], decoded: {..}}
+   *   characteristic_hints, driver_url, starter_command_map: {key: entry}|null,
+   *   dedicated_integration: {domain, name, url, summary}|null,
+   *   safety: [{opcode, reason}]}], decoded: {..}}
+   * The three starter_command_map/dedicated_integration/safety fields are optional per match (an
+   * older engine, or a family with nothing to offer, omits or nulls them); every consumer here
+   * treats their absence as "nothing to offer" rather than an error.
    */
   identify(address) {
     return this._call({ type: 'blueshark/identify', address });

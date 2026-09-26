@@ -1,8 +1,10 @@
 // Step 3: Learn. The prober: codec picker, "Try a command" (single opcode or raw bytes),
 // "Sweep" (bounded, canary-guarded, destructive-gated) with a live results table, "Listen" for
-// notify frames, and building the command map one control at a time.
+// notify frames, and building the command map one control at a time. Raw GATT/codec-override/
+// raw-send/JSON-editing tools and "include destructive" live behind state.advanced; nothing is
+// ever silently skipped -- blocked destructive opcodes are always listed with their reason.
 
-import { h, clear, uid, chip, liveRegion, textField, selectField, checkboxField, withPreservedFocus } from '../components.js';
+import { h, clear, uid, chip, liveRegion, textField, selectField, segmentedField, textareaField, withPreservedFocus } from '../components.js';
 import { adoptSharedStyles } from '../styles.js';
 import {
   CODEC_CATALOG,
@@ -14,12 +16,19 @@ import {
   formatElapsedSince,
   formatApiErrorMessage,
   formatByte,
+  formatSafetyList,
   displayHex,
 } from '../format.js';
-import { buildCommandMapEntry, uniqueCommandKey, DEFAULT_LISTEN_SECONDS, CANARY_INTERVAL, describeBusy } from '../wizard.js';
-
-const DESTRUCTIVE_RISK_MESSAGE =
-  "Destructive opcodes can change this device's persistent settings (factory reset, memory erase, mode changes) and the engine will still attempt any opcode you send \u2014 it does not know which ones are safe. A successful destructive write cannot be undone by this wizard. Only include them if you are prepared for that.";
+import {
+  buildCommandMapEntry,
+  uniqueCommandKey,
+  DEFAULT_LISTEN_SECONDS,
+  CANARY_INTERVAL,
+  describeBusy,
+  safetyForCodec,
+  blockedSweepOpcodes,
+  validateCommandMapJson,
+} from '../wizard.js';
 
 class BsStepLearn extends HTMLElement {
   constructor() {
@@ -41,6 +50,9 @@ class BsStepLearn extends HTMLElement {
     this._builder = null;
     this._builderError = null;
 
+    this._commandMapJsonDraft = null;
+    this._commandMapJsonError = null;
+
     this._tryOpcodeId = uid('learn-try-opcode');
     this._tryArgHexId = uid('learn-try-arg');
     this._tryRawHexId = uid('learn-try-raw');
@@ -56,12 +68,12 @@ class BsStepLearn extends HTMLElement {
     this._builderMaxId = uid('learn-builder-max');
     this._builderSecondaryOpcodeId = uid('learn-builder-secondary-opcode');
     this._builderSecondaryArgId = uid('learn-builder-secondary-arg');
+    this._commandMapJsonId = uid('learn-commandmap-json');
 
     this.attachShadow({ mode: 'open' });
     adoptSharedStyles(this.shadowRoot);
-    this._confirmDialog = document.createElement('bs-confirm-dialog');
     this._contentRoot = h('div');
-    this.shadowRoot.append(this._contentRoot, this._confirmDialog);
+    this.shadowRoot.append(this._contentRoot);
   }
 
   set api(value) {
@@ -130,7 +142,7 @@ class BsStepLearn extends HTMLElement {
     let promoteFields = null;
     let framed = false;
     try {
-      if (this._tryMode === 'opcode') {
+      if (this._effectiveTryMode(state) === 'opcode') {
         const opcode = parseOpcode(this._tryOpcode === '' ? NaN : Number(this._tryOpcode));
         payloadHex = buildPayloadFromOpcode(opcode, this._tryArgumentHex);
         const { hex: argumentHex } = parseHex(this._tryArgumentHex, { allowEmpty: true });
@@ -224,18 +236,8 @@ class BsStepLearn extends HTMLElement {
     }
   }
 
-  async _toggleDestructive(checked) {
-    if (!checked) {
-      this._wizard.dispatch({ type: 'SWEEP_CONFIGURE', config: { includeDestructive: false } });
-      return;
-    }
-    const confirmed = await this._confirmDialog.open({
-      title: 'Include destructive opcodes?',
-      message: DESTRUCTIVE_RISK_MESSAGE,
-      confirmLabel: 'Include them',
-      cancelLabel: 'Keep them excluded',
-    });
-    this._wizard.dispatch({ type: 'SWEEP_CONFIGURE', config: { includeDestructive: confirmed } });
+  _effectiveTryMode(state) {
+    return state.advanced ? this._tryMode : 'opcode';
   }
 
   // --- Listen ----------------------------------------------------------------------
@@ -320,7 +322,7 @@ class BsStepLearn extends HTMLElement {
 
     const nameField = textField({ label: 'Name', id: this._builderNameId, value: b.name, onInput: (v) => { b.name = v; } });
     const noteField = textField({ label: 'Note (optional)', id: this._builderNoteId, value: b.note, onInput: (v) => { b.note = v; } });
-    const kindField = selectField({
+    const kindField = segmentedField({
       label: 'Control type',
       id: uid('learn-builder-kind'),
       value: b.kind,
@@ -384,8 +386,8 @@ class BsStepLearn extends HTMLElement {
       ]),
     );
 
-    return h('section', { class: 'bs-card', style: { padding: '12px', borderColor: 'var(--bs-primary)' } }, [
-      h('h3', { style: { margin: '0 0 8px' } }, 'Make this a control'),
+    return h('section', { class: 'bs-section bs-builder-panel' }, [
+      h('h3', {}, 'Make this a control'),
       ...fields,
     ]);
   }
@@ -393,6 +395,7 @@ class BsStepLearn extends HTMLElement {
   // --- Section renderers -------------------------------------------------------------
 
   _renderCodecSection(state) {
+    if (!state.advanced) return null;
     const field = selectField({
       label: 'Codec',
       id: uid('learn-codec'),
@@ -400,27 +403,32 @@ class BsStepLearn extends HTMLElement {
       options: CODEC_CATALOG.map((entry) => ({ value: entry.id, label: entry.label })),
       onChange: (v) => this._wizard.dispatch({ type: 'SELECT_CODEC', codecId: v }),
     });
-    return h('section', { class: 'bs-card', style: { padding: '12px' } }, [h('h3', { style: { margin: '0 0 8px' } }, 'Codec'), field.element]);
+    return h('section', { class: 'bs-section' }, [h('h3', {}, 'Codec'), field.element]);
   }
 
   _renderTrySection(state) {
     const busy = Boolean(describeBusy(state));
-    const modeField = selectField({
-      label: 'Mode',
-      id: uid('learn-try-mode'),
-      value: this._tryMode,
-      options: [
-        { value: 'opcode', label: 'By opcode' },
-        { value: 'raw', label: 'Raw bytes (skips codec framing)' },
-      ],
-      onChange: (v) => {
-        this._tryMode = v;
-        this._render();
-      },
-    });
-    const fields = [modeField.element];
+    const mode = this._effectiveTryMode(state);
+    const fields = [];
 
-    if (this._tryMode === 'opcode') {
+    if (state.advanced) {
+      const modeField = segmentedField({
+        label: 'Mode',
+        id: uid('learn-try-mode'),
+        value: this._tryMode,
+        options: [
+          { value: 'opcode', label: 'By opcode' },
+          { value: 'raw', label: 'Raw bytes (skips codec framing)' },
+        ],
+        onChange: (v) => {
+          this._tryMode = v;
+          this._render();
+        },
+      });
+      fields.push(modeField.element);
+    }
+
+    if (mode === 'opcode') {
       const opcodeField = textField({
         label: 'Opcode (0-255)',
         type: 'number',
@@ -470,7 +478,7 @@ class BsStepLearn extends HTMLElement {
       );
     }
 
-    return h('section', { class: 'bs-card', style: { padding: '12px' } }, [h('h3', { style: { margin: '0 0 8px' } }, 'Try a command'), ...fields]);
+    return h('section', { class: 'bs-section' }, [h('h3', {}, 'Try a command'), ...fields]);
   }
 
   _renderSweepRowsTable(state) {
@@ -549,12 +557,6 @@ class BsStepLearn extends HTMLElement {
     argHexField.value = this._sweepArgumentHexDraft ?? cfg.argumentHex;
     argHexField.addEventListener('value-change', (event) => { this._sweepArgumentHexDraft = event.detail.value; });
 
-    const destructive = checkboxField({
-      label: `Include destructive opcodes (canary check every ${CANARY_INTERVAL} probes either way)`,
-      checked: cfg.includeDestructive,
-      onChange: (checked) => this._toggleDestructive(checked),
-    });
-
     const startStopBtn = running
       ? h('button', { type: 'button', class: 'bs-btn bs-btn--danger', onClick: () => this._stopSweepRun(state) }, 'Stop sweep')
       : h(
@@ -570,10 +572,11 @@ class BsStepLearn extends HTMLElement {
     }
 
     const sections = [
-      h('h3', { style: { margin: '0 0 8px' } }, 'Sweep'),
+      h('h3', {}, 'Sweep'),
       h('div', { class: 'bs-field-row' }, [startField.element, endField.element, delayField.element, awaitField.element]),
       argHexField,
-      destructive.element,
+      h('p', { class: 'bs-empty' }, `A canary check runs every ${CANARY_INTERVAL} probes either way, confirming the device is still responsive.`),
+      this._renderDestructiveSection(state, cfg),
       h('div', { class: 'bs-btn-row' }, [startStopBtn]),
     ];
 
@@ -586,7 +589,61 @@ class BsStepLearn extends HTMLElement {
 
     sections.push(announce, this._renderSweepRowsTable(state));
 
-    return h('section', { class: 'bs-card', style: { padding: '12px' } }, sections);
+    return h('section', { class: 'bs-section' }, sections);
+  }
+
+  // Shows exactly which opcodes in the configured range are being held back for safety (from
+  // `safety`, never a silent skip). Behind Advanced only: the hold-to-confirm control that
+  // includes them anyway. Turning inclusion back off needs no confirmation -- it is the safe
+  // direction.
+  _renderDestructiveSection(state, cfg) {
+    const safety = safetyForCodec(state.identify.matches, state.identify.codecId);
+    const blockedRows = formatSafetyList(blockedSweepOpcodes(safety, { start: cfg.start, end: cfg.end, includeDestructive: cfg.includeDestructive }));
+    const parts = [];
+
+    if (blockedRows.length) {
+      parts.push(
+        h('div', { class: 'bs-callout' }, [
+          h(
+            'p',
+            { style: { margin: '0' } },
+            `${blockedRows.length} opcode${blockedRows.length === 1 ? '' : 's'} in this range ${blockedRows.length === 1 ? 'is' : 'are'} destructive and will be skipped:`,
+          ),
+          h(
+            'ul',
+            { class: 'bs-evidence' },
+            blockedRows.map((row) => h('li', {}, [h('span', { class: 'bs-mono' }, row.opcodeLabel), ` \u2014 ${row.reason}`])),
+          ),
+        ]),
+      );
+    }
+
+    if (state.advanced) {
+      if (cfg.includeDestructive) {
+        parts.push(
+          h('div', { class: 'bs-field-row', style: { alignItems: 'center' } }, [
+            chip({ tone: 'warning', label: 'Destructive opcodes included' }),
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'bs-btn bs-btn--text',
+                onClick: () => this._wizard.dispatch({ type: 'SWEEP_CONFIGURE', config: { includeDestructive: false } }),
+              },
+              'Exclude them again',
+            ),
+          ]),
+        );
+      } else {
+        const holdBtn = document.createElement('bs-hold-button');
+        holdBtn.label = 'Hold to include destructive opcodes';
+        holdBtn.disabled = state.learn.sweep.running;
+        holdBtn.addEventListener('confirm', () => this._wizard.dispatch({ type: 'SWEEP_CONFIGURE', config: { includeDestructive: true } }));
+        parts.push(holdBtn);
+      }
+    }
+
+    return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px' } }, parts);
   }
 
   _renderListenSection(state) {
@@ -623,7 +680,7 @@ class BsStepLearn extends HTMLElement {
     const announce = liveRegion('polite');
     if (listen.active) announce.textContent = `Listening: ${listen.frames.length} frame${listen.frames.length === 1 ? '' : 's'} received`;
 
-    const sections = [h('h3', { style: { margin: '0 0 8px' } }, 'Listen'), h('div', { class: 'bs-field-row', style: { alignItems: 'flex-end' } }, [secondsField.element, startStopBtn])];
+    const sections = [h('h3', {}, 'Listen'), h('div', { class: 'bs-field-row', style: { alignItems: 'flex-end' } }, [secondsField.element, startStopBtn])];
     if (!notifyChar) sections.push(h('p', { class: 'bs-empty' }, 'No notify channel is selected in Identify \u2014 listening is unavailable until one is.'));
     if (listen.active) {
       sections.push(
@@ -633,7 +690,7 @@ class BsStepLearn extends HTMLElement {
     if (listen.error) sections.push(h('div', { class: 'bs-banner bs-banner--error' }, formatApiErrorMessage(listen.error)));
     sections.push(announce, framesTable);
 
-    return h('section', { class: 'bs-card', style: { padding: '12px' } }, sections);
+    return h('section', { class: 'bs-section' }, sections);
   }
 
   _describeCommandEntry(entry) {
@@ -666,7 +723,64 @@ class BsStepLearn extends HTMLElement {
       },
     ];
     table.rows = state.learn.commandOrder;
-    return h('section', { class: 'bs-card', style: { padding: '12px' } }, [h('h3', { style: { margin: '0 0 8px' } }, 'Command map'), table]);
+    const sections = [h('h3', {}, 'Command map'), table];
+    if (state.advanced) sections.push(this._renderCommandMapJsonEditor(state));
+    return h('section', { class: 'bs-section' }, sections);
+  }
+
+  // Advanced-only: the same command map as raw JSON. A local draft (like the sweep argument hex
+  // above) so an in-progress, possibly-invalid edit never fights the table's own live view of
+  // wizard state; "Apply" parses + validates (the same shape command_map.py enforces) before
+  // dispatching SET_COMMAND_MAP, and any failure names the offending key instead of failing
+  // silently.
+  _renderCommandMapJsonEditor(state) {
+    const draft = this._commandMapJsonDraft ?? JSON.stringify(state.learn.commandMap, null, 2);
+    const field = textareaField({
+      label: 'Command map JSON',
+      id: this._commandMapJsonId,
+      value: draft,
+      mono: true,
+      rows: 12,
+      onInput: (v) => { this._commandMapJsonDraft = v; },
+    });
+    const fields = [
+      field.element,
+      h('div', { class: 'bs-btn-row' }, [
+        h('button', { type: 'button', class: 'bs-btn bs-btn--primary', onClick: () => this._applyCommandMapJson() }, 'Apply JSON'),
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'bs-btn bs-btn--text',
+            onClick: () => { this._commandMapJsonDraft = null; this._commandMapJsonError = null; this._render(); },
+          },
+          'Reset to current',
+        ),
+      ]),
+    ];
+    if (this._commandMapJsonError) fields.push(h('p', { class: 'bs-field__error' }, this._commandMapJsonError));
+    return h('div', { class: 'bs-callout' }, fields);
+  }
+
+  _applyCommandMapJson() {
+    let parsed;
+    try {
+      parsed = JSON.parse(this._commandMapJsonDraft ?? '{}');
+    } catch (err) {
+      this._commandMapJsonError = `Invalid JSON: ${err.message}`;
+      this._render();
+      return;
+    }
+    try {
+      validateCommandMapJson(parsed);
+    } catch (err) {
+      this._commandMapJsonError = err.message;
+      this._render();
+      return;
+    }
+    this._commandMapJsonError = null;
+    this._commandMapJsonDraft = null;
+    this._wizard.dispatch({ type: 'SET_COMMAND_MAP', commandMap: parsed });
   }
 
   // --- Top level ---------------------------------------------------------------------

@@ -17,6 +17,9 @@ import uuid as uuid_mod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
+
+from .command_map import validate_command_map
 
 
 class FamilyConfidence(str, Enum):
@@ -33,6 +36,16 @@ _CONFIDENCE_RANK = {
 
 
 @dataclass(frozen=True)
+class DedicatedIntegration:
+    """A full, separately-installable HA integration that already covers this family."""
+
+    domain: str
+    name: str
+    url: str
+    summary: str
+
+
+@dataclass(frozen=True)
 class FamilyMatch:
     family_id: str
     name: str
@@ -41,6 +54,8 @@ class FamilyMatch:
     public_driver_url: str | None
     codec_id: str | None
     command_characteristic_hints: list[str]
+    starter_command_map: dict[str, dict[str, Any]] | None = None
+    dedicated_integration: DedicatedIntegration | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +174,9 @@ class Advert:
 
     def name_starts_with(self, *prefixes: str) -> bool:
         return any(self._lower_name.startswith(p) for p in prefixes)
+
+    def name_equals(self, name: str) -> bool:
+        return self._lower_name == name.lower()
 
     def name_contains(self, fragment: str) -> bool:
         return fragment in self._lower_name
@@ -349,6 +367,8 @@ class _Family:
     codec_id: str | None = None
     hints: list[str] = field(default_factory=list)
     confirm: Callable[[GattView], str | None] = _never_confirms
+    starter_command_map: dict[str, dict[str, Any]] | None = None
+    dedicated_integration: DedicatedIntegration | None = None
 
 
 def _confirm_pair(
@@ -364,7 +384,126 @@ def _confirm_pair(
     )
 
 
+def _detect_iledclock(advert: Advert) -> _Detection | None:
+    if not advert.name_equals("iledclock"):
+        return None
+    return _Detection(
+        FamilyConfidence.LIKELY,
+        [f'advertised name "{advert.name}" is exactly "iLedClock"'],
+    )
+
+
+def _confirm_iledclock(gatt: GattView) -> str | None:
+    return _confirm_pair(
+        gatt, "0000fff0-", "0000fff1-", "iLedClock command channel confirmed"
+    )
+
+
+# Every command below is verified against the decompiled vendor app
+# (/data/home/tmp/led1248/src/sources/com/jtkj/led1248/light/), one starter entry per
+# ILedClockUtils.java builder function, restricted to safe, reversible actions the existing
+# command_map schema can already express.
+_ILEDCLOCK_STARTER_COMMAND_MAP_RAW: dict[str, dict[str, Any]] = {
+    # ILedClockUtils.java:4738-4747 getSwitchData(bool): payload ["05", "01"|"00"].
+    "power": {
+        "name": "Power",
+        "kind": "switch",
+        "on": {"opcode": 0x05, "argument_hex": "01"},
+        "off": {"opcode": 0x05, "argument_hex": "00"},
+    },
+    # ILedClockUtils.java:4749-4754 getSetBrightness(int): payload ["04", value]. Range
+    # verified in ILedClockSettingsFragment.java: progress = brightness - 5, floored at 0
+    # (lines 115-119); value sent = progress + 5 (lines 186-188); the compiled layout
+    # (res/layout/i_led_clock_settings_fragment.xml inside the APK, resource id
+    # bright_seek_bar = R.java:8759 0x7f0900a4) sets android:max="250" - so the UI only ever
+    # sends 5..255, never 0..100 or 0..255.
+    "brightness": {
+        "name": "Brightness",
+        "kind": "number",
+        "opcode": 0x04,
+        "min": 5,
+        "max": 255,
+    },
+    # ILedClockUtils.java:5057-5062 setRotate(int): payload ["0c", value]. Only ever called
+    # with 0-3: ILedClockRotateActivity.java:42-45 builds exactly 4 fixed list rows (values
+    # 0,1,2,3), :50 posts RotateILedClockSetEvent(i) with that row's own value, and
+    # DeviceManager.java:6967-6968 forwards `action` straight into setRotate unmodified.
+    "rotation": {
+        "name": "Rotation",
+        "kind": "number",
+        "opcode": 0x0C,
+        "min": 0,
+        "max": 3,
+    },
+    # ILedClockUtils.java:4904-4914 getStopwatchStartOrStop(bool): payload ["10","03","01"|"00"].
+    "stopwatch_start": {
+        "name": "Stopwatch: start",
+        "kind": "button",
+        "opcode": 0x10,
+        "argument_hex": "0301",
+    },
+    "stopwatch_stop": {
+        "name": "Stopwatch: stop",
+        "kind": "button",
+        "opcode": 0x10,
+        "argument_hex": "0300",
+    },
+    # ILedClockUtils.java:4897-4902 getStopwatchReset(): payload ["10","02"], no further bytes.
+    "stopwatch_reset": {
+        "name": "Stopwatch: reset",
+        "kind": "button",
+        "opcode": 0x10,
+        "argument_hex": "02",
+    },
+    # ILedClockUtils.java:4933-4943 getCountDownStartOrStop(bool): payload ["0f","03","01"|"00"].
+    # (Countdown reset needs h/m/s - getCountDownReset(int,int,int), ILedClockUtils.java:
+    # 4923-4931 - so it takes user input and cannot be a static starter button; omitted.)
+    "countdown_start": {
+        "name": "Countdown: start",
+        "kind": "button",
+        "opcode": 0x0F,
+        "argument_hex": "0301",
+    },
+    "countdown_stop": {
+        "name": "Countdown: stop",
+        "kind": "button",
+        "opcode": 0x0F,
+        "argument_hex": "0300",
+    },
+    # ILedClockUtils.java:4977-4987 getScoreBoardStartOrStop(bool): payload ["11","04","01"|"00"].
+    "scoreboard_start": {
+        "name": "Scoreboard: start",
+        "kind": "button",
+        "opcode": 0x11,
+        "argument_hex": "0401",
+    },
+    "scoreboard_stop": {
+        "name": "Scoreboard: stop",
+        "kind": "button",
+        "opcode": 0x11,
+        "argument_hex": "0400",
+    },
+}
+# Validated once at import time: this constant IS validate_command_map's normalized output,
+# so "passes validate_command_map unchanged" is true by construction (also asserted in
+# tests/test_families.py for anyone who edits the raw dict above).
+ILEDCLOCK_STARTER_COMMAND_MAP: dict[str, dict[str, Any]] = validate_command_map(
+    _ILEDCLOCK_STARTER_COMMAND_MAP_RAW
+)
+
+ILEDCLOCK_DEDICATED_INTEGRATION = DedicatedIntegration(
+    domain="iledclock",
+    name="iLedClock",
+    url="https://github.com/nphil/ha-iledclock",
+    summary="Clock faces, pixel art and animations, alarms, timers and night mode",
+)
+
+
 def _detect_coolled(advert: Advert) -> _Detection | None:
+    if advert.name_equals("iledclock"):
+        # iLedClock advertises CoolLED framing but has its own opcode table and its own,
+        # more specific family below (codec_id="iledclock"); do not double-claim it here.
+        return None
     evidence: list[str] = []
     named = advert.name_starts_with("coolled", "iled")
     if named:
@@ -555,6 +694,17 @@ def _detect_ac_infinity(advert: Advert) -> _Detection | None:
 
 FAMILIES: list[_Family] = [
     _Family(
+        id="iledclock",
+        name="iLedClock",
+        detect=_detect_iledclock,
+        driver_url=None,
+        codec_id="iledclock",
+        hints=["fff1"],
+        confirm=_confirm_iledclock,
+        starter_command_map=ILEDCLOCK_STARTER_COMMAND_MAP,
+        dedicated_integration=ILEDCLOCK_DEDICATED_INTEGRATION,
+    ),
+    _Family(
         id="coolled",
         name="CoolLED (CoolLEDX / iLedClock)",
         detect=_detect_coolled,
@@ -691,6 +841,8 @@ def identify(input: FingerprintInput) -> list[FamilyMatch]:
                 public_driver_url=fam.driver_url,
                 codec_id=fam.codec_id,
                 command_characteristic_hints=fam.hints,
+                starter_command_map=fam.starter_command_map,
+                dedicated_integration=fam.dedicated_integration,
             )
         )
     matches.extend(command_channel_matches(gatt))

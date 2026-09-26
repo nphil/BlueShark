@@ -155,6 +155,32 @@ export function formatFamilyBadge(family) {
   };
 }
 
+/** "BlueShark already knows N safe commands for this device" when `starter_command_map` is a
+ * non-empty object, else null. `starter_command_map` is an optional FamilyMatch field the engine
+ * only sends once it has beginner-safe commands recorded for this family. */
+export function formatStarterCommandMessage(family) {
+  const starter = family?.starter_command_map;
+  if (!starter || typeof starter !== 'object') return null;
+  const count = Object.keys(starter).length;
+  if (count === 0) return null;
+  return `BlueShark already knows ${count} safe command${count === 1 ? '' : 's'} for this device.`;
+}
+
+/** One `{opcode, reason}` entry from a FamilyMatch's `safety` list -> a display-ready row.
+ * Falls back to the contract's documented default when the engine sent no reason. */
+export function formatSafetyEntry(entry) {
+  const opcode = Number(entry?.opcode);
+  if (!Number.isInteger(opcode) || opcode < 0 || opcode > 255) return null;
+  const reason = String(entry?.reason ?? '').trim() || 'Unknown effect; blocked to be safe.';
+  return { opcode, opcodeLabel: formatByte(opcode), reason };
+}
+
+/** A `safety` array -> display-ready rows: invalid entries dropped, sorted by opcode. */
+export function formatSafetyList(safety) {
+  if (!Array.isArray(safety)) return [];
+  return safety.map(formatSafetyEntry).filter(Boolean).sort((a, b) => a.opcode - b.opcode);
+}
+
 /** manufacturer_data ({decimalId: lowercaseHex}) -> display rows. */
 export function formatManufacturerData(manufacturerData) {
   if (!manufacturerData || typeof manufacturerData !== 'object') return [];
@@ -288,6 +314,29 @@ export function entryDashboardUrl(domain = 'blueshark') {
   return `/config/integrations/integration/${domain}`;
 }
 
+/** `dedicated_integration` -> a display-ready callout, or null when absent or malformed.
+ * `installedComponents` is `hass.config.components` (passed in already-extracted so this stays
+ * hass-free and pure): when it includes the integration's domain the CTA opens that integration's
+ * own config-entry page instead of linking out. */
+export function describeDedicatedIntegration(family, installedComponents) {
+  const info = family?.dedicated_integration;
+  if (!info || typeof info !== 'object') return null;
+  const domain = String(info.domain ?? '').trim();
+  const name = String(info.name ?? '').trim();
+  if (!domain || !name) return null;
+  const summary = String(info.summary ?? '').trim();
+  const installed = Array.isArray(installedComponents) && installedComponents.includes(domain);
+  return {
+    domain,
+    name,
+    summary,
+    installed,
+    headline: `A full integration exists: ${name}${summary ? ` \u2014 ${summary}` : ''}`,
+    ctaLabel: installed ? 'Installed \u2014 open it' : 'View the integration',
+    ctaHref: installed ? entryDashboardUrl(domain) : (String(info.url ?? '').trim() || null),
+  };
+}
+
 /** Device's advertised name, or its address when nameless. */
 export function formatDeviceLabel(device) {
   const name = String(device?.name ?? '').trim();
@@ -387,6 +436,7 @@ export function describeCharacteristic(characteristic) {
 export const CODEC_CATALOG = [
   { id: 'raw', label: 'Raw (no framing)' },
   { id: 'coolled', label: 'CoolLED (CoolLEDX / iLedClock)' },
+  { id: 'iledclock', label: 'iLedClock (CoolLED framing)' },
   { id: 'prefix_suffix', label: 'Header / trailer / checksum' },
 ];
 

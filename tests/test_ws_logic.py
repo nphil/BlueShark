@@ -17,7 +17,7 @@ from custom_components.blueshark.const import (
     WS_ERROR_TIMEOUT,
     WS_ERROR_UNSUPPORTED,
 )
-from custom_components.blueshark.families import FamilyConfidence, FingerprintInput, identify
+from custom_components.blueshark.families import FamilyConfidence, FamilyMatch, FingerprintInput, identify
 from custom_components.blueshark.sweep import SweepStep
 from custom_components.blueshark.websocket_api import (
     AdvertisementSnapshot,
@@ -29,9 +29,12 @@ from custom_components.blueshark.websocket_api import (
     decoded_facts,
     encode_for_wire,
     error_code_for_exception,
+    flow_id_to_adopt,
     opcode_log_tail,
+    safety_notes,
     send_result,
     shape_enumerate,
+    shape_family_match,
     shape_identify,
     shape_scan_event,
     sweep_final_event,
@@ -124,7 +127,7 @@ class ShapeScanEventTests(unittest.TestCase):
     def test_recognises_the_coolled_test_device(self):
         info = AdvertisementSnapshot(
             address="01:00:00:67:0D:8A",
-            name="iLedClock",
+            name="CoolLED-Test",
             rssi=-55,
             source="proxy1",
             connectable=True,
@@ -159,13 +162,80 @@ class ShapeIdentifyTests(unittest.TestCase):
     def test_shapes_matches_and_decoded_facts_together(self):
         manufacturer_data = {COOLLED_MANUFACTURER_ID: COOLLED_MFG_DATA}
         matches = identify(
-            FingerprintInput(name="iLedClock", service_uuids=["fff0"], manufacturer_data=manufacturer_data)
+            FingerprintInput(name="CoolLED-Test", service_uuids=["fff0"], manufacturer_data=manufacturer_data)
         )
         result = shape_identify(matches, manufacturer_data, {})
         self.assertEqual(len(result["matches"]), 1)
         self.assertEqual(result["matches"][0]["codec_id"], "coolled")
         self.assertIn("fff1", result["matches"][0]["characteristic_hints"])
         self.assertEqual(result["decoded"]["coolled_panel"]["width"], 32)
+
+
+class ShapeFamilyMatchTests(unittest.TestCase):
+    def test_iledclock_match_carries_starter_map_dedicated_integration_and_safety(self):
+        match = identify(FingerprintInput(name="iLedClock"))[0]
+        shaped = shape_family_match(match)
+        self.assertEqual(shaped["starter_command_map"]["power"]["kind"], "switch")
+        self.assertEqual(shaped["dedicated_integration"]["domain"], "iledclock")
+        self.assertEqual(shaped["dedicated_integration"]["url"], "https://github.com/nphil/ha-iledclock")
+        self.assertEqual(
+            {row["opcode"] for row in shaped["safety"]},
+            {0x02, 0x03, 0x09, 0x0A, 0x0E, 0x14, 0x15, 0x16, 0x1A, 0xFE, 0xFF},
+        )
+        self.assertTrue(all(row["reason"] for row in shaped["safety"]))
+
+    def test_codec_less_match_has_empty_safety_and_no_starter_map_or_integration(self):
+        match = FamilyMatch(
+            family_id="command-channel:1234",
+            name="Command channel on 1234",
+            confidence=FamilyConfidence.POSSIBLE,
+            evidence=["some evidence"],
+            public_driver_url=None,
+            codec_id=None,
+            command_characteristic_hints=["1234"],
+        )
+        shaped = shape_family_match(match)
+        self.assertEqual(shaped["safety"], [])
+        self.assertIsNone(shaped["starter_command_map"])
+        self.assertIsNone(shaped["dedicated_integration"])
+
+    def test_safety_falls_back_to_a_generic_reason_for_an_opcode_missing_its_own(self):
+        # A destructive opcode with no entry in a codec's destructive_reasons must still be
+        # reported as unsafe, with a fallback reason - never silently treated as safe.
+        class _BareCodec:
+            id = "bare"
+            destructive_opcodes = frozenset({0x99})
+            destructive_reasons: dict[int, str] = {}
+
+        self.assertEqual(
+            safety_notes(_BareCodec()),
+            [{"opcode": 0x99, "reason": "Unknown effect; blocked to be safe"}],
+        )
+
+    def test_safety_notes_of_no_codec_is_empty(self):
+        self.assertEqual(safety_notes(None), [])
+
+
+class FlowIdToAdoptTests(unittest.TestCase):
+    """`flow_id_to_adopt` (websocket_api.py): the pure create_entry adoption decision."""
+
+    def test_matches_an_in_progress_flow_by_normalized_unique_id(self):
+        in_progress = [{"flow_id": "abc", "context": {"unique_id": "AA:BB:CC:DD:EE:FF", "source": "bluetooth"}}]
+        self.assertEqual(flow_id_to_adopt("aa:bb:cc:dd:ee:ff", in_progress), "abc")
+
+    def test_no_match_when_no_flow_claims_that_address(self):
+        in_progress = [{"flow_id": "abc", "context": {"unique_id": "11:22:33:44:55:66"}}]
+        self.assertIsNone(flow_id_to_adopt("aa:bb:cc:dd:ee:ff", in_progress))
+
+    def test_empty_in_progress_list_adopts_nothing(self):
+        self.assertIsNone(flow_id_to_adopt("aa:bb:cc:dd:ee:ff", []))
+
+    def test_flow_with_no_unique_id_in_context_is_ignored(self):
+        in_progress = [{"flow_id": "abc", "context": {"source": "panel"}}]
+        self.assertIsNone(flow_id_to_adopt("aa:bb:cc:dd:ee:ff", in_progress))
+
+    def test_flow_with_no_context_at_all_is_ignored(self):
+        self.assertIsNone(flow_id_to_adopt("aa:bb:cc:dd:ee:ff", [{"flow_id": "abc"}]))
 
 
 class ShapeEnumerateTests(unittest.TestCase):

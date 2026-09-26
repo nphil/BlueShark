@@ -15,10 +15,17 @@ import {
   buildSwitchEntry,
   buildCommandMapEntry,
   uniqueCommandKey,
+  starterCommandMapForCodec,
+  safetyForCodec,
+  blockedSweepOpcodes,
+  validateCommandMapJson,
   createWizard,
   restoreState,
+  restoreAdvanced,
+  persistAdvanced,
   STEP_ORDER,
   SCHEMA_VERSION,
+  ADVANCED_STORAGE_KEY,
 } from '../../custom_components/blueshark/panel/wizard.js';
 
 function memoryStorage() {
@@ -221,6 +228,99 @@ test('ADD_COMMAND stores an entry under its key exactly once and REMOVE_COMMAND 
   assert.deepEqual(removed.learn.commandOrder, []);
 });
 
+// --- beginner path: starter command pre-fill, destructive-opcode safety -----------
+
+test('starterCommandMapForCodec returns the map for the matching codec, null otherwise or when empty', () => {
+  const matches = [
+    { id: 'iledclock', codec_id: 'iledclock', starter_command_map: { power: { name: 'Power', kind: 'button', opcode: 5, argument_hex: '01' } } },
+    { id: 'coolled', codec_id: 'coolled', starter_command_map: {} },
+  ];
+  assert.deepEqual(starterCommandMapForCodec(matches, 'iledclock'), { power: { name: 'Power', kind: 'button', opcode: 5, argument_hex: '01' } });
+  assert.equal(starterCommandMapForCodec(matches, 'coolled'), null, 'an empty starter map counts as none to offer');
+  assert.equal(starterCommandMapForCodec(matches, 'raw'), null, 'no match uses this codec');
+  assert.equal(starterCommandMapForCodec(null, 'iledclock'), null);
+  assert.equal(starterCommandMapForCodec(matches, null), null);
+});
+
+test('safetyForCodec returns the safety list for the matching codec, [] otherwise', () => {
+  const matches = [{ id: 'iledclock', codec_id: 'iledclock', safety: [{ opcode: 14, reason: 'Sets the device password' }] }];
+  assert.deepEqual(safetyForCodec(matches, 'iledclock'), [{ opcode: 14, reason: 'Sets the device password' }]);
+  assert.deepEqual(safetyForCodec(matches, 'raw'), []);
+  assert.deepEqual(safetyForCodec(null, 'iledclock'), []);
+});
+
+test('blockedSweepOpcodes filters safety to the configured range and clears once destructive is included', () => {
+  const safety = [{ opcode: 5, reason: 'a' }, { opcode: 14, reason: 'b' }, { opcode: 30, reason: 'c' }];
+  assert.deepEqual(
+    blockedSweepOpcodes(safety, { start: 0, end: 20, includeDestructive: false }),
+    [{ opcode: 5, reason: 'a' }, { opcode: 14, reason: 'b' }],
+    'only opcodes inside [start, end] are blocked',
+  );
+  assert.deepEqual(blockedSweepOpcodes(safety, { start: 0, end: 20, includeDestructive: true }), [], 'including destructive holds nothing back');
+  assert.deepEqual(blockedSweepOpcodes([], { start: 0, end: 255, includeDestructive: false }), []);
+});
+
+test('SEED_STARTER_COMMANDS merges starter entries into the draft map exactly once, disambiguating key collisions', () => {
+  let s = reduce(initialState(), { type: 'SELECT_DEVICE', address: 'AA' });
+  s = reduce(s, { type: 'ADD_COMMAND', key: 'power', entry: buildButtonEntry({ name: 'My Power', opcode: 1, argumentHex: '' }) });
+  const starter = {
+    power: { name: 'Power', kind: 'button', opcode: 5, argument_hex: '01' },
+    brightness: { name: 'Brightness', kind: 'number', opcode: 4, min: 0, max: 255 },
+  };
+  const seeded = reduce(s, { type: 'SEED_STARTER_COMMANDS', starterCommandMap: starter });
+  assert.ok(seeded.finish.starterSeeded);
+  assert.deepEqual(seeded.learn.commandOrder, ['power', 'power-2', 'brightness'], 'the colliding starter key is disambiguated, not dropped or overwritten');
+  assert.equal(seeded.learn.commandMap.power.name, 'My Power', "the operator's own probed entry is never clobbered");
+  assert.deepEqual(seeded.learn.commandMap['power-2'], starter.power);
+  const seededAgain = reduce(seeded, { type: 'SEED_STARTER_COMMANDS', starterCommandMap: starter });
+  assert.equal(seededAgain, seeded, 'already-seeded is a no-op, so removing a starter entry afterward cannot be undone by a re-render');
+});
+
+test('SEED_STARTER_COMMANDS with no starter map still marks starterSeeded so it never retries', () => {
+  const s = reduce(initialState(), { type: 'SEED_STARTER_COMMANDS', starterCommandMap: null });
+  assert.ok(s.finish.starterSeeded);
+  assert.deepEqual(s.learn.commandMap, {});
+});
+
+test('RENAME_COMMAND updates only the name field of an existing entry, and no-ops on a blank name or missing key', () => {
+  const entry = buildButtonEntry({ name: 'Power On', note: 'x', opcode: 8, argumentHex: '' });
+  let s = reduce(initialState(), { type: 'ADD_COMMAND', key: 'power_on', entry });
+  s = reduce(s, { type: 'RENAME_COMMAND', key: 'power_on', name: 'Main Power' });
+  assert.equal(s.learn.commandMap.power_on.name, 'Main Power');
+  assert.equal(s.learn.commandMap.power_on.note, 'x', 'renaming must not disturb other fields');
+  const blank = reduce(s, { type: 'RENAME_COMMAND', key: 'power_on', name: '   ' });
+  assert.equal(blank, s, 'a blank name is a no-op, not an empty name');
+  const missing = reduce(s, { type: 'RENAME_COMMAND', key: 'nope', name: 'X' });
+  assert.equal(missing, s, 'renaming a key that does not exist is a no-op');
+});
+
+test('SET_COMMAND_MAP replaces the whole draft map and rebuilds commandOrder from its keys', () => {
+  let s = reduce(initialState(), { type: 'ADD_COMMAND', key: 'old', entry: buildButtonEntry({ name: 'Old', opcode: 1, argumentHex: '' }) });
+  const next = { a: { name: 'A', kind: 'button', opcode: 1, argument_hex: '' }, b: { name: 'B', kind: 'button', opcode: 2, argument_hex: '' } };
+  s = reduce(s, { type: 'SET_COMMAND_MAP', commandMap: next });
+  assert.deepEqual(s.learn.commandMap, next);
+  assert.deepEqual(s.learn.commandOrder, ['a', 'b']);
+});
+
+test('validateCommandMapJson accepts the same shapes buildCommandMapEntry produces', () => {
+  const map = {
+    power: buildButtonEntry({ name: 'Power', opcode: 5, argumentHex: '01' }),
+    brightness: buildNumberEntry({ name: 'Brightness', opcode: 4, min: 0, max: 100 }),
+    relay: buildSwitchEntry({ name: 'Relay', on: { opcode: 8, argumentHex: '01' }, off: { opcode: 8, argumentHex: '00' } }),
+  };
+  assert.equal(validateCommandMapJson(map), map);
+});
+
+test('validateCommandMapJson rejects a bad command id, an unknown kind, and an inverted number range', () => {
+  assert.throws(() => validateCommandMapJson('not an object'), /must be a JSON object/);
+  assert.throws(
+    () => validateCommandMapJson({ 'bad id!': { name: 'X', kind: 'button', opcode: 1, argument_hex: '' } }),
+    /"bad id!" must be 1-64 characters/,
+  );
+  assert.throws(() => validateCommandMapJson({ x: { name: 'X', kind: 'bogus' } }), /kind must be "button", "number" or "switch"/);
+  assert.throws(() => validateCommandMapJson({ x: { name: 'X', kind: 'number', opcode: 1, min: 10, max: 5 } }), /min must be less than max/);
+});
+
 // --- persistence (localStorage restore) -------------------------------------------
 
 test('createWizard restores step, selected device and command map from injected storage', () => {
@@ -288,6 +388,50 @@ test('RESTART clears persisted state and returns a brand-new wizard', () => {
   assert.equal(wizard.getState().step, 'find');
   assert.equal(wizard.getState().find.selectedAddress, null);
   assert.equal(storage.raw.has('blueshark-wizard-state-v1'), false);
+});
+
+// --- advanced flag persistence (its own storage key, independent of wizard progress) ----------
+
+test('SET_ADVANCED toggles the flag and is a no-op when set to the same value', () => {
+  const s0 = initialState();
+  assert.equal(s0.advanced, false);
+  const on = reduce(s0, { type: 'SET_ADVANCED', advanced: true });
+  assert.equal(on.advanced, true);
+  const same = reduce(on, { type: 'SET_ADVANCED', advanced: true });
+  assert.equal(same, on, 'setting the same value is a no-op');
+});
+
+test('RESTART preserves the advanced flag even though it clears everything else', () => {
+  let s = reduce(initialState(), { type: 'SET_ADVANCED', advanced: true });
+  s = reduce(s, { type: 'SELECT_DEVICE', address: 'AA' });
+  const restarted = reduce(s, { type: 'RESTART' });
+  assert.equal(restarted.advanced, true);
+  assert.equal(restarted.step, 'find');
+  assert.equal(restarted.find.selectedAddress, null);
+});
+
+test('restoreAdvanced/persistAdvanced round-trip through injected storage and default to false', () => {
+  const storage = memoryStorage();
+  assert.equal(restoreAdvanced(storage), false, 'nothing stored yet defaults to off');
+  persistAdvanced(storage, true);
+  assert.equal(restoreAdvanced(storage), true);
+  assert.ok(storage.raw.has(ADVANCED_STORAGE_KEY));
+});
+
+test('createWizard persists SET_ADVANCED under its own key, independent of and surviving RESTART on the wizard-progress key', () => {
+  const storage = memoryStorage();
+  const wizard1 = createWizard({ storage });
+  wizard1.dispatch({ type: 'SELECT_DEVICE', address: 'AA' });
+  wizard1.dispatch({ type: 'SET_ADVANCED', advanced: true });
+  assert.ok(storage.raw.has(ADVANCED_STORAGE_KEY));
+
+  wizard1.dispatch({ type: 'RESTART' });
+  assert.equal(storage.raw.has('blueshark-wizard-state-v1'), false, 'wizard progress is cleared as usual');
+  assert.ok(storage.raw.has(ADVANCED_STORAGE_KEY), 'the advanced preference survives RESTART');
+  assert.equal(wizard1.getState().advanced, true);
+
+  const wizard2 = createWizard({ storage });
+  assert.equal(wizard2.getState().advanced, true, 'a fresh wizard instance still picks up the persisted preference');
 });
 
 // --- panel chrome: the sidebar toggle is the only way back on a narrow screen -----------------

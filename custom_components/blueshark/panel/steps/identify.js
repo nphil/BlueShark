@@ -7,6 +7,8 @@ import { adoptSharedStyles } from '../styles.js';
 import {
   formatFamilyBadge,
   formatEvidence,
+  formatStarterCommandMessage,
+  describeDedicatedIntegration,
   formatDecodedFacts,
   formatApiErrorMessage,
   shortUuid,
@@ -117,14 +119,37 @@ class BsStepIdentify extends HTMLElement {
   _renderMatch(match) {
     const badge = formatFamilyBadge({ ...match, name: match.name ?? match.id });
     const evidence = formatEvidence(match.evidence);
-    return h('div', { class: 'bs-card', style: { padding: '12px', border: '1px solid var(--bs-divider)' } }, [
+    const starterMessage = formatStarterCommandMessage(match);
+    const dedicated = describeDedicatedIntegration(match, this._api?.hass?.config?.components);
+    return h('div', { class: 'bs-match' }, [
       h('div', { class: 'bs-field-row', style: { alignItems: 'center' } }, [
         h('strong', {}, match.name ?? match.id ?? 'Unknown family'),
         badge?.confidenceLabel ? h('span', { class: 'bs-badge' }, badge.confidenceLabel) : null,
       ]),
       evidence.length ? h('ul', { class: 'bs-evidence' }, evidence.map((line) => h('li', {}, line))) : null,
       match.driver_url ? h('a', { href: match.driver_url, target: '_blank', rel: 'noopener noreferrer' }, 'Public driver reference') : null,
+      starterMessage ? h('p', { class: 'bs-empty' }, starterMessage) : null,
+      dedicated ? this._renderDedicatedIntegration(dedicated) : null,
     ]);
+  }
+
+  // A beginner-path callout: "a full integration exists" with either an "Installed - open it"
+  // link to that integration's own config-entry page, or an outbound link when it is not
+  // installed yet. Rendered as a hairline tile (bs-callout), never a second card fill.
+  _renderDedicatedIntegration(dedicated) {
+    const cta = dedicated.ctaHref
+      ? h(
+          'a',
+          {
+            href: dedicated.ctaHref,
+            class: 'bs-btn bs-btn--text',
+            target: dedicated.installed ? null : '_blank',
+            rel: dedicated.installed ? null : 'noopener noreferrer',
+          },
+          dedicated.ctaLabel,
+        )
+      : null;
+    return h('div', { class: 'bs-callout' }, [h('p', { style: { margin: '0' } }, dedicated.headline), cta]);
   }
 
   _renderChannelButtons(row, state) {
@@ -268,7 +293,13 @@ class BsStepIdentify extends HTMLElement {
       } else {
         sections.push(h('p', { class: 'bs-empty' }, 'No write+notify pair was found automatically \u2014 pick one below.'));
       }
-      sections.push(this._renderGattTable(state));
+      if (state.advanced || !suggested) {
+        sections.push(this._renderGattTable(state));
+      } else {
+        sections.push(
+          h('p', { class: 'bs-empty' }, 'Using the suggested channel automatically. Switch on Advanced (top of the page) to see the raw GATT table and choose a different one.'),
+        );
+      }
     }
 
     const canContinue = Boolean(state.identify.services && state.identify.selectedCharacteristic && state.identify.codecId);

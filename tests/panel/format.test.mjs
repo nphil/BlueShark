@@ -10,6 +10,10 @@ import {
   formatElapsedSince,
   formatConfidenceLabel,
   formatFamilyBadge,
+  formatStarterCommandMessage,
+  describeDedicatedIntegration,
+  formatSafetyEntry,
+  formatSafetyList,
   formatDecodedFacts,
   pickBestSource,
   slugify,
@@ -139,6 +143,59 @@ test('formatFamilyBadge falls back to a numeric percentage only when confidence_
 test('formatFamilyBadge returns null for no match, never a badge with an empty name', () => {
   assert.equal(formatFamilyBadge(null), null);
   assert.equal(formatFamilyBadge({ confidence: 1 }), null);
+});
+
+// --- beginner path: starter-command messaging, dedicated integration, safety list -------
+
+test('formatStarterCommandMessage counts starter_command_map entries, singular/plural, null when absent or empty', () => {
+  assert.equal(formatStarterCommandMessage({ starter_command_map: { a: {}, b: {} } }), 'BlueShark already knows 2 safe commands for this device.');
+  assert.equal(formatStarterCommandMessage({ starter_command_map: { a: {} } }), 'BlueShark already knows 1 safe command for this device.');
+  assert.equal(formatStarterCommandMessage({ starter_command_map: {} }), null);
+  assert.equal(formatStarterCommandMessage({}), null);
+  assert.equal(formatStarterCommandMessage(null), null);
+});
+
+test('describeDedicatedIntegration builds the "Installed - open it" CTA only when hass.config.components includes the domain', () => {
+  const family = {
+    dedicated_integration: {
+      domain: 'iledclock',
+      name: 'iLedClock',
+      url: 'https://github.com/nphil/ha-iledclock',
+      summary: 'Clock faces, pixel art and animations',
+    },
+  };
+  const notInstalled = describeDedicatedIntegration(family, ['default_config']);
+  assert.equal(notInstalled.installed, false);
+  assert.equal(notInstalled.ctaLabel, 'View the integration');
+  assert.equal(notInstalled.ctaHref, 'https://github.com/nphil/ha-iledclock');
+  assert.match(notInstalled.headline, /^A full integration exists: iLedClock/);
+
+  const installed = describeDedicatedIntegration(family, ['default_config', 'iledclock']);
+  assert.equal(installed.installed, true);
+  assert.equal(installed.ctaLabel, 'Installed \u2014 open it');
+  assert.equal(installed.ctaHref, '/config/integrations/integration/iledclock');
+});
+
+test('describeDedicatedIntegration returns null when absent or missing a domain/name', () => {
+  assert.equal(describeDedicatedIntegration({}, []), null);
+  assert.equal(describeDedicatedIntegration({ dedicated_integration: { domain: 'x' } }, []), null, 'name is required');
+  assert.equal(describeDedicatedIntegration(null, []), null);
+});
+
+test('formatSafetyEntry falls back to the documented default reason and drops an out-of-range opcode', () => {
+  assert.deepEqual(formatSafetyEntry({ opcode: 14, reason: 'Sets the device password' }), {
+    opcode: 14,
+    opcodeLabel: '0x0E (14)',
+    reason: 'Sets the device password',
+  });
+  assert.equal(formatSafetyEntry({ opcode: 10 }).reason, 'Unknown effect; blocked to be safe.');
+  assert.equal(formatSafetyEntry({ opcode: 999, reason: 'x' }), null);
+});
+
+test('formatSafetyList drops invalid entries and sorts the rest by opcode', () => {
+  const rows = formatSafetyList([{ opcode: 20, reason: 'b' }, { opcode: 5, reason: 'a' }, { opcode: -1, reason: 'bad' }]);
+  assert.deepEqual(rows.map((r) => r.opcode), [5, 20]);
+  assert.deepEqual(formatSafetyList(null), []);
 });
 
 test('formatDecodedFacts flattens the real nested per-family decoded shape and hex-formats firmware', () => {
