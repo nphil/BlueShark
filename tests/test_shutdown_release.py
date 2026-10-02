@@ -22,7 +22,11 @@ HAVE_HA = all(
 )
 
 if HAVE_HA:
-    from custom_components.blueshark import _async_setup_guided_entry, async_setup  # noqa: F401
+    from custom_components.blueshark import (  # noqa: F401
+        _async_setup_guided_entry,
+        _async_setup_legacy_entry,
+        async_setup,
+    )
     from custom_components.blueshark import coordinator as coordinator_module
     from custom_components.blueshark import transport as transport_module
     from custom_components.blueshark.codecs import get_codec
@@ -36,7 +40,7 @@ if HAVE_HA:
     from custom_components.blueshark.coordinator import (
         BlueSharkDevice,
         async_get_transport,
-        async_release_unowned_transports_at_shutdown,
+        async_release_domain_links_at_shutdown,
     )
     from custom_components.blueshark.transport import ShuttingDownError
     from custom_components.blueshark import shutdown
@@ -230,7 +234,7 @@ class ShutdownReleaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(wizard.connected)
         owned_device.transport.async_release_for_shutdown = AsyncMock()
 
-        await async_release_unowned_transports_at_shutdown(self.hass)
+        await async_release_domain_links_at_shutdown(self.hass)
 
         self.assertFalse(wizard.connected)
         owned_device.transport.async_release_for_shutdown.assert_not_awaited()
@@ -300,7 +304,7 @@ class DomainLatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen_at_first_await, [1])
         hass.async_add_shutdown_job.assert_called_once()
         job = hass.async_add_shutdown_job.call_args.args[0]
-        self.assertEqual(job.target, async_release_unowned_transports_at_shutdown)
+        self.assertEqual(job.target, async_release_domain_links_at_shutdown)
 
     async def test_domain_job_latches_every_transport_even_ones_an_entry_owns(self) -> None:
         owned = async_get_transport(self.hass, ADDRESS, "Fan")
@@ -309,7 +313,7 @@ class DomainLatchTests(unittest.IsolatedAsyncioTestCase):
         await owned.request(CHAR, b"\x01", 10)
         self.assertTrue(self.gatt.connected)
 
-        await async_release_unowned_transports_at_shutdown(self.hass)
+        await async_release_domain_links_at_shutdown(self.hass)
 
         self.assertTrue(shutdown.in_progress(self.hass))
         # The domain job leaves the owned link to its entry's own job, but nothing may reopen it.
@@ -383,6 +387,182 @@ class DomainLatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(device.opcode_log, [])
         notified.assert_not_called()
         self.assertEqual(self.connects, 0)
+
+
+class _LegacyGatt:
+    """A bleak client as the legacy profile button drives it: services -> characteristic -> write."""
+
+    def __init__(self) -> None:
+        self.connected = True
+        self.disconnect_calls = 0
+        self.writes: list[bytes] = []
+        self.hang_on_write = False
+        self.hang_on_disconnect = False
+        self.write_started = asyncio.Event()
+        characteristic = SimpleNamespace(
+            properties=["write-without-response"], max_write_without_response_size=20
+        )
+        service = SimpleNamespace(get_characteristic=lambda _uuid: characteristic)
+        self.services = SimpleNamespace(get_service=lambda _uuid: service)
+
+    async def write_gatt_char(self, _characteristic, payload, response=False) -> None:
+        self.write_started.set()
+        if self.hang_on_write:
+            while self.connected:  # a dropped link ends the write, as bleak does
+                await asyncio.sleep(0.01)
+            from bleak.exc import BleakError
+
+            raise BleakError("disconnected")
+        self.writes.append(bytes(payload))
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        if self.hang_on_disconnect:
+            await asyncio.sleep(3600)
+        self.connected = False
+
+
+@unittest.skipUnless(HAVE_HA, "needs homeassistant, bleak and bleak-retry-connector")
+class LegacyProfileButtonTests(unittest.IsolatedAsyncioTestCase):
+    """The legacy profile-import buttons own no transport: connect, write once, disconnect in one press.
+
+    A press that is in flight when Home Assistant shuts down still holds a link, so it is registered
+    where the domain job can find it, and no press may open a link once the latch is set.
+    """
+
+    def setUp(self) -> None:
+        from custom_components.blueshark import button as button_module
+
+        self.button_module = button_module
+        self.gatt = _LegacyGatt()
+        self.connects = 0
+        self.hass = SimpleNamespace(data={})
+
+        async def _establish(*_args, **_kwargs):
+            self.connects += 1
+            return self.gatt
+
+        patches = [
+            patch.object(button_module, "establish_connection", side_effect=_establish),
+            patch.object(
+                button_module.bluetooth,
+                "async_ble_device_from_address",
+                return_value=SimpleNamespace(address=ADDRESS, name="dev"),
+            ),
+        ]
+        for started in patches:
+            started.start()
+            self.addCleanup(started.stop)
+
+    def _button(self):
+        command = {
+            "id": "power", "name": "Power", "value": "0801", "response": False,
+            "service": "0000fff0-0000-1000-8000-00805f9b34fb", "characteristic": CHAR,
+        }
+        button = self.button_module.BleCommandButton(
+            hass=self.hass, entry=SimpleNamespace(), address=ADDRESS, allow_writes=True,
+            write_lock=asyncio.Lock(), command=command, device_name="Fan",
+        )
+        button.async_write_ha_state = MagicMock()
+        return button
+
+    async def test_a_normal_press_still_writes_once_and_cleans_up(self) -> None:
+        await self._button().async_press()
+
+        self.assertEqual(self.gatt.writes, [b"\x08\x01"])
+        self.assertEqual(self.gatt.disconnect_calls, 1)
+        self.assertEqual(shutdown.tracked_clients(self.hass), [])
+
+    async def test_press_while_latched_never_connects_and_is_a_clean_error(self) -> None:
+        from homeassistant.exceptions import HomeAssistantError
+
+        shutdown.begin(self.hass)
+
+        with self.assertRaises(HomeAssistantError) as raised:
+            await self._button().async_press()
+
+        self.assertIn("shutting down", str(raised.exception))
+        self.assertEqual(self.connects, 0)
+
+    async def test_press_waiting_for_the_lock_rechecks_the_latch(self) -> None:
+        from homeassistant.exceptions import HomeAssistantError
+
+        button = self._button()
+        await button._write_lock.acquire()  # another press is running
+        waiting = asyncio.create_task(button.async_press())
+        await asyncio.sleep(0.02)
+        shutdown.begin(self.hass)  # shutdown begins while this press waits
+        button._write_lock.release()
+
+        with self.assertRaises(HomeAssistantError):
+            await waiting
+        self.assertEqual(self.connects, 0)
+
+    async def test_connect_in_flight_when_shutdown_begins_is_handed_back(self) -> None:
+        from homeassistant.exceptions import HomeAssistantError
+
+        async def _establish_then_latch(*_args, **_kwargs):
+            self.connects += 1
+            shutdown.begin(self.hass)  # the latch lands while the connect is in flight
+            return self.gatt
+
+        with patch.object(self.button_module, "establish_connection", side_effect=_establish_then_latch):
+            with self.assertRaises(HomeAssistantError):
+                await self._button().async_press()
+
+        self.assertEqual(self.gatt.writes, [])
+        self.assertEqual(self.gatt.disconnect_calls, 1)
+        self.assertFalse(self.gatt.connected)
+        self.assertEqual(shutdown.tracked_clients(self.hass), [])
+
+    async def test_domain_job_drops_the_link_of_a_press_in_flight(self) -> None:
+        from homeassistant.exceptions import HomeAssistantError
+
+        self.gatt.hang_on_write = True
+        pressing = asyncio.create_task(self._button().async_press())
+        await self.gatt.write_started.wait()
+        self.assertEqual(shutdown.tracked_clients(self.hass), [self.gatt])
+
+        with self.assertLogs(coordinator_module._LOGGER, "INFO") as logs:
+            await async_release_domain_links_at_shutdown(self.hass)
+
+        self.assertFalse(self.gatt.connected)
+        self.assertIn("Released BLE link to a legacy profile button at shutdown", "\n".join(logs.output))
+        with self.assertRaises(HomeAssistantError) as raised:
+            await asyncio.wait_for(pressing, 2)  # fails cleanly, as a shutdown refusal not a device fault
+        self.assertIn("shutting down", str(raised.exception))
+        self.assertEqual(shutdown.tracked_clients(self.hass), [])
+
+    async def test_hanging_disconnect_of_a_press_in_flight_is_bounded(self) -> None:
+        self.gatt.hang_on_write = True
+        self.gatt.hang_on_disconnect = True
+        pressing = asyncio.create_task(self._button().async_press())
+        await self.gatt.write_started.wait()
+
+        with (
+            patch.object(coordinator_module, "SHUTDOWN_RELEASE_TIMEOUT_S", 0.2),
+            self.assertLogs(coordinator_module._LOGGER, "WARNING") as logs,
+        ):
+            await asyncio.wait_for(async_release_domain_links_at_shutdown(self.hass), 2)  # returns, not raises
+
+        self.assertIn("Timed out", "\n".join(logs.output))
+        pressing.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pressing
+
+    async def test_legacy_entry_setup_refuses_while_latched(self) -> None:
+        from homeassistant.exceptions import ConfigEntryNotReady
+
+        hass = MagicMock()
+        hass.data = {}
+        hass.config_entries.async_forward_entry_setups = AsyncMock()
+        shutdown.begin(hass)
+
+        with self.assertRaises(ConfigEntryNotReady):
+            await _async_setup_legacy_entry(hass, SimpleNamespace(entry_id="legacy", data={}))
+
+        hass.config_entries.async_forward_entry_setups.assert_not_awaited()
+        self.assertNotIn("legacy", hass.data[DOMAIN])
 
 
 if __name__ == "__main__":

@@ -69,12 +69,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     from homeassistant.core import HassJob
 
-    from .coordinator import async_release_unowned_transports_at_shutdown
+    from .coordinator import async_release_domain_links_at_shutdown
 
     # The onboarding wizard connects before any config entry exists; no entry's own shutdown
     # job covers that link, so one domain-level job releases transports no entry owns.
     hass.async_add_shutdown_job(
-        HassJob(async_release_unowned_transports_at_shutdown, "blueshark release wizard BLE links"), hass
+        HassJob(async_release_domain_links_at_shutdown, "blueshark release wizard BLE links"), hass
     )
 
     from . import websocket_api
@@ -124,6 +124,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_setup_legacy_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Validate the stored evidence before creating disabled button entities."""
+
+    from homeassistant.exceptions import ConfigEntryNotReady
+
+    from . import shutdown
+
+    # Same rule as the guided path: nothing starts, and nothing is retried, while Home Assistant
+    # shuts down. (A legacy entry holds no link until a button is pressed; the buttons check too.)
+    if shutdown.in_progress(hass):
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
 
     try:
         profile = parse_profile(entry.data[CONF_PROFILE])

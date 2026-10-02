@@ -1,7 +1,7 @@
 {
   "domain": "blueshark",
   "name": "BlueShark Integration",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "documentation": "https://github.com/nphil/BlueShark",
   "issue_tracker": "https://github.com/nphil/BlueShark/issues",
   "codeowners": ["@nphil"],

@@ -19,6 +19,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from . import shutdown
 from .const import DOMAIN, WRITE_TIMEOUT
 from .entity_specs import (
     CommandSpec,
@@ -30,6 +31,8 @@ from .entity_specs import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_SHUTTING_DOWN_MESSAGE = "Home Assistant is shutting down; not opening a Bluetooth connection"
 
 
 async def async_setup_entry(
@@ -106,6 +109,10 @@ class BleCommandButton(ButtonEntity):
         # contention; the reason is surfaced in extra state attributes.
         return True
 
+    def _refuse_if_shutting_down(self) -> None:
+        if shutdown.in_progress(self._hass):
+            raise HomeAssistantError(_SHUTTING_DOWN_MESSAGE)
+
     async def async_press(self) -> None:
         """Write exactly one reviewed payload, with one timeout and no retries."""
 
@@ -114,7 +121,10 @@ class BleCommandButton(ButtonEntity):
                 "BLE writes are disabled; reconfigure with allow_writes enabled"
             )
         payload = bytes.fromhex(str(self._command["value"]))
+        self._refuse_if_shutting_down()
         async with self._write_lock:
+            # Re-checked after waiting for the lock: shutdown may have begun while another press ran.
+            self._refuse_if_shutting_down()
             try:
                 async with asyncio.timeout(WRITE_TIMEOUT):
                     # HA's shared Bluetooth stack supports both local adapters
@@ -144,7 +154,13 @@ class BleCommandButton(ButtonEntity):
                         device,
                         self._attr_name,
                     )
+                    # No `await` between the connect returning and registering the client, so a
+                    # shutdown job always sees a link that is open. The domain job drops it.
+                    shutdown.track_client(self._hass, client)
                     try:
+                        if shutdown.in_progress(self._hass):
+                            # Shutdown began while the connect was in flight: hand the link back.
+                            raise HomeAssistantError(_SHUTTING_DOWN_MESSAGE)
                         service = client.services.get_service(str(self._command["service"]))
                         if service is None:
                             raise HomeAssistantError(
@@ -175,7 +191,10 @@ class BleCommandButton(ButtonEntity):
                             response=bool(self._command["response"]),
                         )
                     finally:
-                        await client.disconnect()
+                        try:
+                            await client.disconnect()
+                        finally:
+                            shutdown.untrack_client(self._hass, client)
                 self._attr_extra_state_attributes.pop("availability_reason", None)
                 self.async_write_ha_state()
             except asyncio.TimeoutError as err:
@@ -186,6 +205,9 @@ class BleCommandButton(ButtonEntity):
                 self.async_write_ha_state()
                 raise HomeAssistantError("BLE command timed out") from err
             except BleakError as err:
+                if shutdown.in_progress(self._hass):
+                    # The shutdown job dropped this link under the press; not a fault of the device.
+                    raise HomeAssistantError(_SHUTTING_DOWN_MESSAGE) from err
                 raise HomeAssistantError(f"BLE connection/write failed: {err}") from err
 
 

@@ -123,12 +123,32 @@ async def _async_release_transport_at_shutdown(transport: BleTransport, label: s
         _LOGGER.info("Released BLE link to %s at shutdown in %.2f s", label, time.monotonic() - started)
 
 
-async def async_release_unowned_transports_at_shutdown(hass: HomeAssistant) -> None:
-    """Shutdown job for transports no guided entry owns (the onboarding wizard's probes).
+async def _async_release_legacy_client_at_shutdown(client: Any, label: str) -> None:
+    """Drop a connected legacy-button client; bounded, never raises, one log line."""
 
-    A wizard session connects before any config entry exists, so no entry's shutdown job
-    covers its link; the 30 s idle timer would otherwise leave it open across a restart.
-    Transports owned by a guided entry are released by that entry's own job, in parallel.
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(SHUTDOWN_RELEASE_TIMEOUT_S):
+            await client.disconnect()
+    except TimeoutError:
+        _LOGGER.warning(
+            "Timed out after %s s releasing the BLE link to %s at shutdown", SHUTDOWN_RELEASE_TIMEOUT_S, label
+        )
+    except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning("Could not release the BLE link to %s at shutdown: %s", label, err)
+    else:
+        _LOGGER.info("Released BLE link to %s at shutdown in %.2f s", label, time.monotonic() - started)
+
+
+async def async_release_domain_links_at_shutdown(hass: HomeAssistant) -> None:
+    """The domain-wide shutdown job (registered once by `async_setup`, never tied to an entry).
+
+    Sets the process-lifetime latch, then releases the links no guided entry's own job covers:
+    transports no entry owns (the onboarding wizard's probes: a wizard session connects before
+    any config entry exists and the 30 s idle timer would keep that link across a restart), and
+    the clients of legacy profile-import button presses that are in flight right now (they
+    have no transport object; see `shutdown.track_client`). Transports owned by a guided entry
+    are released by that entry's own job, in parallel.
     """
 
     shutdown.begin(hass)
@@ -140,6 +160,10 @@ async def async_release_unowned_transports_at_shutdown(hass: HomeAssistant) -> N
         for transport in list(registry.values())
         if transport not in owned
     ]
+    pending.extend(
+        _async_release_legacy_client_at_shutdown(client, "a legacy profile button")
+        for client in shutdown.tracked_clients(hass)
+    )
     if pending:
         await asyncio.gather(*pending)
 

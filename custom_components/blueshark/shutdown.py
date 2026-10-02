@@ -34,3 +34,30 @@ def in_progress(hass: HomeAssistant) -> bool:
     """Whether Home Assistant is shutting down (the latch is set)."""
 
     return bool(hass.data.get(DOMAIN, {}).get(_KEY))
+
+
+# --- links no transport owns -------------------------------------------------------------------
+#
+# The legacy profile-import buttons (button.py) connect, write once and disconnect inside one
+# awaited press, with no transport object. While a press is in flight its client is registered
+# here so the domain shutdown job can find and drop it; it is removed again when the press ends.
+
+_CLIENTS_KEY = "legacy_clients"
+
+
+def track_client(hass: HomeAssistant, client: object) -> None:
+    """Register a connected client that only a button press owns, so shutdown can release it."""
+
+    hass.data.setdefault(DOMAIN, {}).setdefault(_CLIENTS_KEY, set()).add(client)
+
+
+def untrack_client(hass: HomeAssistant, client: object) -> None:
+    """Forget `client` (its press ended)."""
+
+    hass.data.get(DOMAIN, {}).get(_CLIENTS_KEY, set()).discard(client)
+
+
+def tracked_clients(hass: HomeAssistant) -> list[object]:
+    """A snapshot of the clients registered by `track_client`."""
+
+    return list(hass.data.get(DOMAIN, {}).get(_CLIENTS_KEY, ()))
