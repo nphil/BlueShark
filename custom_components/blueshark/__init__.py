@@ -67,6 +67,16 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
 
+    from homeassistant.core import HassJob
+
+    from .coordinator import async_release_unowned_transports_at_shutdown
+
+    # The onboarding wizard connects before any config entry exists; no entry's own shutdown
+    # job covers that link, so one domain-level job releases transports no entry owns.
+    hass.async_add_shutdown_job(
+        HassJob(async_release_unowned_transports_at_shutdown, "blueshark release wizard BLE links"), hass
+    )
+
     from . import websocket_api
     from .services import async_register_services
 
@@ -144,6 +154,14 @@ async def _async_setup_guided_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     device = BlueSharkDevice(hass, entry, transport, codec)
     hass.data[DOMAIN][entry.entry_id] = device
     device.async_start()
+
+    from homeassistant.core import HassJob
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(device.async_release_at_shutdown, f"blueshark release BLE link {device.name}")
+        )
+    )
 
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

@@ -1,5 +1,5 @@
 name: BlueShark
-version: "0.9.1"
+version: "0.9.2"
 slug: blueshark
 description: Web workbench for reviewing BLE captures; Bluetooth is provided by the BlueShark integration.
 url: https://github.com/nphil/BlueShark

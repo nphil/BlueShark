@@ -74,6 +74,10 @@ class TransportDisconnectedError(TransportError):
     """The device disconnected while a request was still awaiting its response."""
 
 
+class ShuttingDownError(TransportError):
+    """Home Assistant is shutting down: this process must not open another BLE connection."""
+
+
 @dataclass(frozen=True)
 class RawResponse:
     """One request/response cycle, before any codec has interpreted it."""
@@ -126,6 +130,8 @@ class BleTransport:
         self._idle_unsub: Callable[[], None] | None = None
         self._current_operation: str | None = None
         self.connected = False
+        # Set once by `async_release_for_shutdown` and never cleared (Home Assistant is going down).
+        self._closing = False
         self.last_unsolicited: bytes | None = None
         self.on_connection_changed: Callable[[bool], None] | None = None
 
@@ -143,6 +149,8 @@ class BleTransport:
     # ------------------------------------------------------------------ the one lock
 
     def _begin_operation(self, name: str) -> None:
+        if self._closing:
+            raise ShuttingDownError(f"{self.address}: Home Assistant is shutting down; not connecting")
         if self._lock.locked():
             raise BusyError(self.address, self._current_operation)
         self._cancel_idle_timer()
@@ -160,6 +168,8 @@ class BleTransport:
     # ------------------------------------------------------------------ connect/disconnect
 
     async def _ensure_connected(self) -> None:
+        if self._closing:
+            raise ShuttingDownError(f"{self.address}: Home Assistant is shutting down; not connecting")
         if self._client is not None and self._client.is_connected:
             return
         device = bluetooth.async_ble_device_from_address(self._hass, self.address, True)
@@ -173,7 +183,7 @@ class BleTransport:
             fresh = bluetooth.async_ble_device_from_address(self._hass, self.address, True)
             return fresh if fresh is not None else device
 
-        self._client = await establish_connection(
+        client = await establish_connection(
             BleakClientWithServiceCache,
             device,
             self.name,
@@ -181,8 +191,22 @@ class BleTransport:
             max_attempts=3,
             ble_device_callback=_freshest,
         )
+        if self._closing:
+            # Shutdown began while the connect was in flight: hand the link straight back.
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - best effort while shutting down
+                _LOGGER.debug("%s: disconnect raised; connection was already gone", self.address, exc_info=True)
+            raise ShuttingDownError(f"{self.address}: Home Assistant is shutting down; not connecting")
+        self._client = client
         self._notify.clear()
         self._set_connected(True)
+
+    def _require_client(self) -> None:
+        """Raise if the link was dropped (an unload or the shutdown release) since the connect."""
+
+        if self._client is None:
+            raise TransportDisconnectedError("device disconnected")
 
     def _set_connected(self, connected: bool) -> None:
         self.connected = connected
@@ -220,6 +244,25 @@ class BleTransport:
         async with self._lock:
             await self._disconnect_locked()
 
+    async def async_release_for_shutdown(self) -> None:
+        """Home Assistant is stopping: latch the transport closed, then drop any open link.
+
+        The latch comes first, so no caller (command, wizard probe, idle reconnect) can open a
+        new connection afterwards. The link is dropped WITHOUT waiting for the lock, so a long
+        ``listen`` or a request awaiting its reply cannot hold the release hostage; a request
+        then ends without a reply. A connect still in
+        flight notices the latch when it completes and hands its link back. One-way, unlike
+        :meth:`async_disconnect`. Callers bound it with a timeout.
+        """
+
+        self._closing = True
+        self._cancel_idle_timer()
+        # Wake a request that is still waiting for its reply instead of letting it sit out its timeout.
+        for state in self._notify.values():
+            if state.pending is not None and not state.pending.done():
+                state.pending.set_exception(TransportDisconnectedError("shutting down"))
+        await self._disconnect_locked()
+
     # ------------------------------------------------------------------ idle timer
 
     def _cancel_idle_timer(self) -> None:
@@ -229,7 +272,7 @@ class BleTransport:
 
     def _schedule_idle_timer(self) -> None:
         self._cancel_idle_timer()
-        if self._idle_disconnect_s <= 0 or self._client is None:
+        if self._idle_disconnect_s <= 0 or self._client is None or self._closing:
             return
         self._idle_unsub = async_call_later(self._hass, self._idle_disconnect_s, self._on_idle_timeout)
 
@@ -266,13 +309,13 @@ class BleTransport:
             for listener in list(state.listeners):
                 listener(time.monotonic(), payload)
 
-        assert self._client is not None
+        self._require_client()
         await self._client.start_notify(characteristic, _handler)
 
     def _write_kwargs(self, characteristic: str) -> bool:
         """Return whether to request a confirmed write (True) or write-without-response."""
 
-        assert self._client is not None
+        self._require_client()
         char = self._client.services.get_characteristic(characteristic)
         if char is None:
             raise UnsupportedOperationError(f"characteristic {characteristic} is not exposed by this device")
@@ -296,7 +339,7 @@ class BleTransport:
             state.pending = future
             start = time.monotonic()
             try:
-                assert self._client is not None
+                self._require_client()
                 await self._client.write_gatt_char(
                     characteristic, payload, response=self._write_kwargs(characteristic)
                 )
@@ -320,7 +363,7 @@ class BleTransport:
         await self._acquire("enumerate")
         try:
             await self._ensure_connected()
-            assert self._client is not None
+            self._require_client()
             services: list[GattServiceInfo] = []
             for service in self._client.services:
                 services.append(

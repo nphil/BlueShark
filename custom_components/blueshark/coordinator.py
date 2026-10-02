@@ -14,6 +14,7 @@ entry must never open two competing connections to the same physical device.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -47,6 +48,9 @@ if TYPE_CHECKING:
     from .transport import BleTransport, RawResponse
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Upper bound for the shutdown-time release. Home Assistant gives all shutdown jobs one shared 20 s budget.
+SHUTDOWN_RELEASE_TIMEOUT_S = 8
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,43 @@ async def async_release_transport(hass: HomeAssistant, address: str) -> None:
     transport = registry.pop(address, None)
     if transport is not None:
         await transport.async_disconnect()
+
+
+async def _async_release_transport_at_shutdown(transport: BleTransport, label: str) -> None:
+    """Latch `transport` closed and drop its link; bounded, never raises, one log line."""
+
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(SHUTDOWN_RELEASE_TIMEOUT_S):
+            await transport.async_release_for_shutdown()
+    except TimeoutError:
+        _LOGGER.warning(
+            "Timed out after %s s releasing the BLE link to %s at shutdown", SHUTDOWN_RELEASE_TIMEOUT_S, label
+        )
+    except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning("Could not release the BLE link to %s at shutdown: %s", label, err)
+    else:
+        _LOGGER.info("Released BLE link to %s at shutdown in %.2f s", label, time.monotonic() - started)
+
+
+async def async_release_unowned_transports_at_shutdown(hass: HomeAssistant) -> None:
+    """Shutdown job for transports no guided entry owns (the onboarding wizard's probes).
+
+    A wizard session connects before any config entry exists, so no entry's shutdown job
+    covers its link; the 30 s idle timer would otherwise leave it open across a restart.
+    Transports owned by a guided entry are released by that entry's own job, in parallel.
+    """
+
+    domain_data = hass.data.get(DOMAIN, {})
+    owned = {runtime.transport for runtime in domain_data.values() if isinstance(runtime, BlueSharkDevice)}
+    registry: dict[str, BleTransport] = domain_data.get(DATA_TRANSPORTS) or {}
+    pending = [
+        _async_release_transport_at_shutdown(transport, transport.name)
+        for transport in list(registry.values())
+        if transport not in owned
+    ]
+    if pending:
+        await asyncio.gather(*pending)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +210,22 @@ class BlueSharkDevice:
             self._unsub_unavailable()
             self._unsub_unavailable = None
         await async_release_transport(self.hass, self.address)
+
+    async def async_release_at_shutdown(self) -> None:
+        """Home Assistant shutdown job (Stage 1, before Bluetooth and the proxies go away).
+
+        Stops the presence watchers, latches the transport closed and drops its link. Bounded,
+        never raises, and deliberately does NOT unload the entry (that would write a wave of
+        ``unavailable`` states); the transport stays registered but can never connect again.
+        """
+
+        if self._unsub_advertisement is not None:
+            self._unsub_advertisement()
+            self._unsub_advertisement = None
+        if self._unsub_unavailable is not None:
+            self._unsub_unavailable()
+            self._unsub_unavailable = None
+        await _async_release_transport_at_shutdown(self.transport, self.name)
 
     # ------------------------------------------------------------------ presence/connection
 
