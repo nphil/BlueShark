@@ -40,6 +40,8 @@ from bleak_retry_connector import BleakClientWithServiceCache, establish_connect
 from homeassistant.components import bluetooth
 from homeassistant.helpers.event import async_call_later
 
+from . import shutdown
+
 if TYPE_CHECKING:
     import asyncio
 
@@ -135,6 +137,12 @@ class BleTransport:
         self.last_unsolicited: bytes | None = None
         self.on_connection_changed: Callable[[bool], None] | None = None
 
+    @property
+    def _is_closing(self) -> bool:
+        """This transport was latched by its own release, or the whole integration was (domain latch)."""
+
+        return self._closing or shutdown.in_progress(self._hass)
+
     # ------------------------------------------------------------------ options
 
     def set_idle_disconnect_s(self, seconds: int) -> None:
@@ -149,7 +157,7 @@ class BleTransport:
     # ------------------------------------------------------------------ the one lock
 
     def _begin_operation(self, name: str) -> None:
-        if self._closing:
+        if self._is_closing:
             raise ShuttingDownError(f"{self.address}: Home Assistant is shutting down; not connecting")
         if self._lock.locked():
             raise BusyError(self.address, self._current_operation)
@@ -168,7 +176,7 @@ class BleTransport:
     # ------------------------------------------------------------------ connect/disconnect
 
     async def _ensure_connected(self) -> None:
-        if self._closing:
+        if self._is_closing:
             raise ShuttingDownError(f"{self.address}: Home Assistant is shutting down; not connecting")
         if self._client is not None and self._client.is_connected:
             return
@@ -191,7 +199,7 @@ class BleTransport:
             max_attempts=3,
             ble_device_callback=_freshest,
         )
-        if self._closing:
+        if self._is_closing:
             # Shutdown began while the connect was in flight: hand the link straight back.
             try:
                 await client.disconnect()
@@ -272,7 +280,7 @@ class BleTransport:
 
     def _schedule_idle_timer(self) -> None:
         self._cancel_idle_timer()
-        if self._idle_disconnect_s <= 0 or self._client is None or self._closing:
+        if self._idle_disconnect_s <= 0 or self._client is None or self._is_closing:
             return
         self._idle_unsub = async_call_later(self._hass, self._idle_disconnect_s, self._on_idle_timeout)
 

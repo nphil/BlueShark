@@ -143,8 +143,17 @@ async def _async_setup_legacy_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
 async def _async_setup_guided_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Build the device runtime (transport + coordinator + codec) and forward platforms."""
 
+    from homeassistant.exceptions import ConfigEntryNotReady
+
+    from . import shutdown
     from .codecs import get_codec
     from .coordinator import BlueSharkDevice, async_get_transport
+
+    # Setup and reload during Home Assistant's shutdown must not start anything: an entry set up now
+    # registers its shutdown job too late (the job list is read once). There is no `await` between
+    # this check and the job registration below, so it cannot be invalidated in between.
+    if shutdown.in_progress(hass):
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
 
     address = str(entry.data[CONF_ADDRESS])
     transport = async_get_transport(hass, address, entry.title or address)

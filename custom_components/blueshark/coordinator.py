@@ -35,6 +35,7 @@ from .const import (
     DOMAIN,
     MAX_OPCODE_LOG_ENTRIES,
 )
+from . import shutdown
 from .sweep import verdict as _verdict
 
 #: Mirrors `homeassistant.helpers.device_registry.CONNECTION_BLUETOOTH`.
@@ -130,6 +131,7 @@ async def async_release_unowned_transports_at_shutdown(hass: HomeAssistant) -> N
     Transports owned by a guided entry are released by that entry's own job, in parallel.
     """
 
+    shutdown.begin(hass)
     domain_data = hass.data.get(DOMAIN, {})
     owned = {runtime.transport for runtime in domain_data.values() if isinstance(runtime, BlueSharkDevice)}
     registry: dict[str, BleTransport] = domain_data.get(DATA_TRANSPORTS) or {}
@@ -219,6 +221,7 @@ class BlueSharkDevice:
         ``unavailable`` states); the transport stays registered but can never connect again.
         """
 
+        shutdown.begin(self.hass)
         if self._unsub_advertisement is not None:
             self._unsub_advertisement()
             self._unsub_advertisement = None

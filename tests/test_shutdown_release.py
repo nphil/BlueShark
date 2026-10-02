@@ -39,6 +39,7 @@ if HAVE_HA:
         async_release_unowned_transports_at_shutdown,
     )
     from custom_components.blueshark.transport import ShuttingDownError
+    from custom_components.blueshark import shutdown
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 CHAR = "0000fff1-0000-1000-8000-00805f9b34fb"
@@ -236,6 +237,152 @@ class ShutdownReleaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(self.hass.data[DOMAIN][DATA_TRANSPORTS]), {ADDRESS, "11:22:33:44:55:66"})
         with self.assertRaises(ShuttingDownError):
             await wizard.enumerate_gatt()
+
+
+@unittest.skipUnless(HAVE_HA, "needs homeassistant, bleak and bleak-retry-connector")
+class DomainLatchTests(unittest.IsolatedAsyncioTestCase):
+    """Rules A-D of the addendum: Home Assistant reads its job list once, at the start of Stage 1."""
+
+    def setUp(self) -> None:
+        self.gatt = FakeGatt()
+        self.connects = 0
+
+        async def _establish(*_args, **_kwargs):
+            self.connects += 1
+            self.gatt.connected = True
+            return self.gatt
+
+        patches = [
+            patch.object(transport_module, "establish_connection", side_effect=_establish),
+            patch.object(
+                transport_module.bluetooth,
+                "async_ble_device_from_address",
+                return_value=SimpleNamespace(address=ADDRESS, name="dev"),
+            ),
+            patch.object(transport_module, "async_call_later", return_value=MagicMock()),
+        ]
+        for started in patches:
+            started.start()
+            self.addCleanup(started.stop)
+
+        self.hass = SimpleNamespace(data={})
+
+    def _guided_hass(self) -> MagicMock:
+        hass = MagicMock()
+        hass.data = {}
+        hass.config_entries.async_forward_entry_setups = AsyncMock()
+        return hass
+
+    def _guided_entry(self) -> MagicMock:
+        entry = MagicMock()
+        entry.title = "Fan"
+        entry.data = {CONF_ADDRESS: ADDRESS, CONF_CHARACTERISTIC: CHAR, CONF_CODEC_ID: "raw"}
+        entry.options = {}
+        return entry
+
+    # -- A: the domain job -------------------------------------------------------------------
+
+    async def test_domain_job_is_registered_by_async_setup_before_its_first_await(self) -> None:
+        hass = self._guided_hass()
+        seen_at_first_await: list[int] = []
+
+        async def _register_static_paths(_paths) -> None:
+            seen_at_first_await.append(hass.async_add_shutdown_job.call_count)
+
+        hass.http.async_register_static_paths = _register_static_paths
+        with (
+            patch("custom_components.blueshark.websocket_api.async_register_commands"),
+            patch("custom_components.blueshark.services.async_register_services"),
+            patch("homeassistant.components.frontend.async_register_built_in_panel"),
+        ):
+            self.assertTrue(await async_setup(hass, {}))
+
+        self.assertEqual(seen_at_first_await, [1])
+        hass.async_add_shutdown_job.assert_called_once()
+        job = hass.async_add_shutdown_job.call_args.args[0]
+        self.assertEqual(job.target, async_release_unowned_transports_at_shutdown)
+
+    async def test_domain_job_latches_every_transport_even_ones_an_entry_owns(self) -> None:
+        owned = async_get_transport(self.hass, ADDRESS, "Fan")
+        entry = SimpleNamespace(data={CONF_ADDRESS: ADDRESS, CONF_CHARACTERISTIC: CHAR}, options={}, title="Fan")
+        self.hass.data[DOMAIN]["entry-id"] = BlueSharkDevice(self.hass, entry, owned, get_codec("raw", {}))
+        await owned.request(CHAR, b"\x01", 10)
+        self.assertTrue(self.gatt.connected)
+
+        await async_release_unowned_transports_at_shutdown(self.hass)
+
+        self.assertTrue(shutdown.in_progress(self.hass))
+        # The domain job leaves the owned link to its entry's own job, but nothing may reopen it.
+        with self.assertRaises(ShuttingDownError):
+            await owned.request(CHAR, b"\x01", 10)
+        self.assertEqual(self.connects, 1)
+
+    async def test_transport_created_after_the_latch_refuses_to_connect(self) -> None:
+        """A wizard probe arriving mid-Stage-1 creates a fresh transport nobody released."""
+        shutdown.begin(self.hass)
+        fresh = async_get_transport(self.hass, "11:22:33:44:55:66", "Late wizard probe")
+
+        with self.assertRaises(ShuttingDownError):
+            await fresh.enumerate_gatt()
+        self.assertEqual(self.connects, 0)
+        self.assertFalse(fresh.is_busy())
+
+    # -- B: setup refuses --------------------------------------------------------------------
+
+    async def test_guided_setup_and_reload_refuse_while_latched(self) -> None:
+        from homeassistant.exceptions import ConfigEntryNotReady
+
+        hass = self._guided_hass()
+        shutdown.begin(hass)
+
+        with patch.object(BlueSharkDevice, "async_start") as start:
+            with self.assertRaises(ConfigEntryNotReady):
+                await _async_setup_guided_entry(hass, self._guided_entry())
+
+        start.assert_not_called()  # no watchers started
+        hass.async_add_shutdown_job.assert_not_called()
+        hass.config_entries.async_forward_entry_setups.assert_not_awaited()
+        self.assertNotIn(DATA_TRANSPORTS, hass.data.get(DOMAIN, {}))  # not even a transport was created
+
+    # -- C: the per-entry job exists before setup first yields ---------------------------------
+
+    async def test_entry_job_is_registered_before_setup_first_yields(self) -> None:
+        hass = self._guided_hass()
+        seen: list[int] = []
+
+        async def _forward(*_args) -> None:
+            seen.append(hass.async_add_shutdown_job.call_count)
+
+        hass.config_entries.async_forward_entry_setups = _forward
+
+        with patch.object(BlueSharkDevice, "async_start"):
+            self.assertTrue(await _async_setup_guided_entry(hass, self._guided_entry()))
+
+        self.assertEqual(seen, [1])
+
+    # -- D: refusals are not faults ----------------------------------------------------------
+
+    async def test_refused_command_leaves_no_trace_of_a_failure(self) -> None:
+        from custom_components.blueshark.const import CONF_COMMAND_MAP
+
+        transport = async_get_transport(self.hass, ADDRESS, "Fan")
+        entry = SimpleNamespace(
+            data={CONF_ADDRESS: ADDRESS, CONF_CHARACTERISTIC: CHAR},
+            options={CONF_COMMAND_MAP: {"power": {"kind": "button", "payload_hex": "0801"}}},
+            title="Fan",
+        )
+        device = BlueSharkDevice(self.hass, entry, transport, get_codec("raw", {}))
+        notified = MagicMock()
+        device.async_add_listener(notified)
+        shutdown.begin(self.hass)
+
+        with self.assertRaises(ShuttingDownError):
+            await device.async_send_command("power")
+
+        self.assertIsNone(device.last_response)
+        self.assertEqual(device.opcode_log, [])
+        notified.assert_not_called()
+        self.assertEqual(self.connects, 0)
 
 
 if __name__ == "__main__":
