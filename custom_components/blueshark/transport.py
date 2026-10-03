@@ -29,9 +29,10 @@ Design constraints (see the project brief this was built against):
 
 from __future__ import annotations
 
+import asyncio as _aio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,10 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+#: No single connect / subscribe / write step may hang longer than this (startup contract S4);
+#: bleak and bleak-retry-connector have no overall bound of their own on a stuck proxy link.
+STEP_TIMEOUT_S = 10
 
 
 class TransportError(Exception):
@@ -74,6 +79,10 @@ class UnsupportedOperationError(TransportError):
 
 class TransportDisconnectedError(TransportError):
     """The device disconnected while a request was still awaiting its response."""
+
+
+class StepTimeoutError(TransportError):
+    """A connect / subscribe / write step did not finish within `STEP_TIMEOUT_S`."""
 
 
 class ShuttingDownError(TransportError):
@@ -191,14 +200,18 @@ class BleTransport:
             fresh = bluetooth.async_ble_device_from_address(self._hass, self.address, True)
             return fresh if fresh is not None else device
 
-        client = await establish_connection(
-            BleakClientWithServiceCache,
-            device,
-            self.name,
-            disconnected_callback=self._on_disconnected,
-            max_attempts=3,
-            ble_device_callback=_freshest,
-        )
+        try:
+            async with _aio.timeout(STEP_TIMEOUT_S):
+                client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    device,
+                    self.name,
+                    disconnected_callback=self._on_disconnected,
+                    max_attempts=3,
+                    ble_device_callback=_freshest,
+                )
+        except TimeoutError:
+            raise StepTimeoutError(f"{self.address}: connecting took longer than {STEP_TIMEOUT_S} s") from None
         if self._is_closing:
             # Shutdown began while the connect was in flight: hand the link straight back.
             try:
@@ -209,6 +222,20 @@ class BleTransport:
         self._client = client
         self._notify.clear()
         self._set_connected(True)
+
+    async def _bounded(self, step: str, awaitable: Awaitable[None]) -> None:
+        """Run one GATT step on the open link; if it hangs, drop the link so the next try starts clean."""
+
+        try:
+            async with _aio.timeout(STEP_TIMEOUT_S):
+                await awaitable
+        except TimeoutError:
+            try:
+                async with _aio.timeout(STEP_TIMEOUT_S):
+                    await self._disconnect_locked()
+            except Exception:  # noqa: BLE001 - best effort; the step failure is what matters
+                _LOGGER.debug("%s: dropping the stuck link raised", self.address, exc_info=True)
+            raise StepTimeoutError(f"{self.address}: {step} took longer than {STEP_TIMEOUT_S} s") from None
 
     def _require_client(self) -> None:
         """Raise if the link was dropped (an unload or the shutdown release) since the connect."""
@@ -318,7 +345,7 @@ class BleTransport:
                 listener(time.monotonic(), payload)
 
         self._require_client()
-        await self._client.start_notify(characteristic, _handler)
+        await self._bounded("subscribing", self._client.start_notify(characteristic, _handler))
 
     def _write_kwargs(self, characteristic: str) -> bool:
         """Return whether to request a confirmed write (True) or write-without-response."""
@@ -348,8 +375,11 @@ class BleTransport:
             start = time.monotonic()
             try:
                 self._require_client()
-                await self._client.write_gatt_char(
-                    characteristic, payload, response=self._write_kwargs(characteristic)
+                await self._bounded(
+                    "writing",
+                    self._client.write_gatt_char(
+                        characteristic, payload, response=self._write_kwargs(characteristic)
+                    ),
                 )
                 try:
                     response = await _asyncio.wait_for(future, timeout=await_response_ms / 1000)

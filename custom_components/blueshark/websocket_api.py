@@ -368,6 +368,7 @@ _ERROR_CODE_BY_EXC_NAME: dict[str, str] = {
     "ValueError": WS_ERROR_REFUSED,
     "DeviceNotFoundError": "not_found",
     "SweepRunNotFoundError": "not_found",
+    "StepTimeoutError": WS_ERROR_TIMEOUT,
     "TimeoutError": WS_ERROR_TIMEOUT,
 }
 
