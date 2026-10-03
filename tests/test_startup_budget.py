@@ -26,7 +26,11 @@ if HAVE_HA:
     from custom_components.blueshark.codecs import get_codec
     from custom_components.blueshark.const import CONF_ADDRESS, CONF_CHARACTERISTIC, CONF_CODEC_ID
     from custom_components.blueshark.coordinator import BlueSharkDevice, async_get_transport
-    from custom_components.blueshark.transport import StepTimeoutError
+    from custom_components.blueshark.transport import (
+        NOTIFY_BACKEND_TIMEOUT_S,
+        STEP_TIMEOUT_S as REAL_STEP_TIMEOUT_S,
+        StepTimeoutError,
+    )
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 CHAR = "0000fff1-0000-1000-8000-00805f9b34fb"
@@ -39,11 +43,13 @@ class _HangingGatt:
         self.hang = hang
         self.is_connected = True
         self.disconnected = False
+        self.notify_kwargs: dict = {}
         self.services = SimpleNamespace(
             get_characteristic=lambda _u: SimpleNamespace(properties=["write-without-response"])
         )
 
-    async def start_notify(self, *_a, **_k) -> None:
+    async def start_notify(self, *_a, **kwargs) -> None:
+        self.notify_kwargs = kwargs
         if self.hang == "notify":
             await asyncio.sleep(3600)
 
@@ -152,6 +158,23 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(gatt.disconnected)  # the next attempt starts from a clean link
                 self.assertFalse(transport.connected)
                 self.assertFalse(transport.is_busy())
+
+    async def test_subscribe_gives_the_backend_a_timeout_shorter_than_the_outer_guard(self) -> None:
+        # A subscribe that never acknowledges must be ended by the proxy backend's own timeout (which
+        # unregisters its notification handler), not by cancelling it from outside; the outer guard
+        # is only a safety net, so the backend bound has to be shorter, even for two round-trips.
+        transport = async_get_transport(self.hass, ADDRESS, "Fan")
+        gatt = _HangingGatt("notify")
+
+        async def _establish(*_a, **_k):
+            return gatt
+
+        with patch.object(transport_module, "establish_connection", side_effect=_establish):
+            with self.assertRaises(StepTimeoutError):
+                await transport.request(CHAR, b"\x01", 10)
+        passed = gatt.notify_kwargs["timeout"]
+        self.assertEqual(passed, NOTIFY_BACKEND_TIMEOUT_S)
+        self.assertLess(2 * passed, REAL_STEP_TIMEOUT_S)
 
 
 if __name__ == "__main__":

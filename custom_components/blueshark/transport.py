@@ -55,6 +55,12 @@ _LOGGER = logging.getLogger(__name__)
 #: bleak and bleak-retry-connector have no overall bound of their own on a stuck proxy link.
 STEP_TIMEOUT_S = 10
 
+#: Passed to `start_notify(timeout=...)`. bleak-esphome bounds EACH proxy round-trip with it (subscribe,
+#: then the descriptor write: <= 2 x 4 s) and, on its own timeout, unregisters the notification handler.
+#: The outer `STEP_TIMEOUT_S` guard would cancel mid-flight and leave that handler registered, so it is
+#: only a safety net. Other backends ignore the keyword.
+NOTIFY_BACKEND_TIMEOUT_S = 4.0
+
 
 class TransportError(Exception):
     """Base class for every error this module raises."""
@@ -345,7 +351,10 @@ class BleTransport:
                 listener(time.monotonic(), payload)
 
         self._require_client()
-        await self._bounded("subscribing", self._client.start_notify(characteristic, _handler))
+        await self._bounded(
+            "subscribing",
+            self._client.start_notify(characteristic, _handler, timeout=NOTIFY_BACKEND_TIMEOUT_S),
+        )
 
     def _write_kwargs(self, characteristic: str) -> bool:
         """Return whether to request a confirmed write (True) or write-without-response."""
